@@ -10,10 +10,10 @@ use tk::models::TrainerWrapper;
 use tk::Trainer;
 use tokenizers as tk;
 
+// Match your Rust trainer enums
+use tk::models::bpe::trainer::{BpeScoreBy, BpeStopBy};
+
 /// Base class for all trainers
-///
-/// This class is not supposed to be instantiated directly. Instead, any implementation of a
-/// Trainer will return an instance of this class when instantiated.
 #[pyclass(module = "tokenizers.trainers", name = "Trainer", subclass)]
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -48,6 +48,7 @@ impl PyTrainer {
         })
     }
 }
+
 #[pymethods]
 impl PyTrainer {
     fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
@@ -146,50 +147,59 @@ macro_rules! setter {
     }};
 }
 
+// ----------------- helpers: map enums <-> Python -----------------
+
+fn score_by_from_py(s: &str) -> PyResult<BpeScoreBy> {
+    match s.to_ascii_lowercase().as_str() {
+        "count" | "bpe" | "frequency" => Ok(BpeScoreBy::Count),
+        "exact_ll" | "greedy_ll_exact" | "exact" => Ok(BpeScoreBy::GreedyLLExact),
+        "approx_ll" | "greedy_ll_approx" | "approx" => Ok(BpeScoreBy::GreedyLLApprox),
+        _ => Err(exceptions::PyValueError::new_err(format!(
+            "Invalid score_by: {s}. Expected one of 'count' | 'exact_ll' | 'approx_ll'"
+        ))),
+    }
+}
+
+fn score_by_to_py(s: &BpeScoreBy) -> &'static str {
+    match s {
+        BpeScoreBy::Count => "count",
+        BpeScoreBy::GreedyLLExact => "exact_ll",
+        BpeScoreBy::GreedyLLApprox => "approx_ll",
+    }
+}
+
+fn stop_by_from_py(obj: &Bound<'_, PyAny>) -> PyResult<BpeStopBy> {
+    let s: String = obj.extract()?;
+    match s.to_ascii_lowercase().as_str() {
+        "vocab" | "vocab_size" => Ok(BpeStopBy::VocabSize),
+        "delta_ll_exact" | "exact_ll_stop" | "dll_exact" => Ok(BpeStopBy::DeltaLLExact),
+        "delta_ll_approx" | "approx_ll_stop" | "dll_approx" => Ok(BpeStopBy::DeltaLLApprox),
+        other => Err(exceptions::PyValueError::new_err(format!(
+            "Invalid stop_by: {other}. Expected 'vocab_size' | 'delta_ll_exact' | 'delta_ll_approx'"
+        ))),
+    }
+}
+
+fn stop_by_to_py<'py>(py: Python<'py>, s: &BpeStopBy) -> PyObject {
+    let tag = match s {
+        BpeStopBy::VocabSize => "vocab_size",
+        BpeStopBy::DeltaLLExact => "delta_ll_exact",
+        BpeStopBy::DeltaLLApprox => "delta_ll_approx",
+    };
+    // pyo3 0.25: convert Bound<'py, PyString> -> Bound<'py, PyAny> -> Py<PyAny> (= PyObject)
+    PyString::new(py, tag).into_any().unbind().into()
+}
+
 /// Trainer capable of training a BPE model
-///
-/// Args:
-///     vocab_size (:obj:`int`, `optional`):
-///         The size of the final vocabulary, including all tokens and alphabet.
-///
-///     min_frequency (:obj:`int`, `optional`):
-///         The minimum frequency a pair should have in order to be merged.
-///
-///     show_progress (:obj:`bool`, `optional`):
-///         Whether to show progress bars while training.
-///
-///     special_tokens (:obj:`List[Union[str, AddedToken]]`, `optional`):
-///         A list of special tokens the model should know of.
-///
-///     limit_alphabet (:obj:`int`, `optional`):
-///         The maximum different characters to keep in the alphabet.
-///
-///     initial_alphabet (:obj:`List[str]`, `optional`):
-///         A list of characters to include in the initial alphabet, even
-///         if not seen in the training dataset.
-///         If the strings contain more than one character, only the first one
-///         is kept.
-///
-///     continuing_subword_prefix (:obj:`str`, `optional`):
-///         A prefix to be used for every subword that is not a beginning-of-word.
-///
-///     end_of_word_suffix (:obj:`str`, `optional`):
-///         A suffix to be used for every subword that is a end-of-word.
-///
-///     max_token_length (:obj:`int`, `optional`):
-///         Prevents creating tokens longer than the specified size.
-///         This can help with reducing polluting your vocabulary with
-///         highly repetitive tokens like `======` for wikipedia
-///
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "BpeTrainer")]
 pub struct PyBpeTrainer {}
+
 #[pymethods]
 impl PyBpeTrainer {
     #[getter]
     fn get_vocab_size(self_: PyRef<Self>) -> usize {
         getter!(self_, BpeTrainer, vocab_size)
     }
-
     #[setter]
     fn set_vocab_size(self_: PyRef<Self>, vocab_size: usize) {
         setter!(self_, BpeTrainer, vocab_size, vocab_size);
@@ -199,7 +209,6 @@ impl PyBpeTrainer {
     fn get_min_frequency(self_: PyRef<Self>) -> u64 {
         getter!(self_, BpeTrainer, min_frequency)
     }
-
     #[setter]
     fn set_min_frequency(self_: PyRef<Self>, freq: u64) {
         setter!(self_, BpeTrainer, min_frequency, freq);
@@ -209,7 +218,6 @@ impl PyBpeTrainer {
     fn get_show_progress(self_: PyRef<Self>) -> bool {
         getter!(self_, BpeTrainer, show_progress)
     }
-
     #[setter]
     fn set_show_progress(self_: PyRef<Self>, show_progress: bool) {
         setter!(self_, BpeTrainer, show_progress, show_progress);
@@ -226,7 +234,6 @@ impl PyBpeTrainer {
                 .collect()
         )
     }
-
     #[setter]
     fn set_special_tokens(self_: PyRef<Self>, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
         setter!(
@@ -256,7 +263,6 @@ impl PyBpeTrainer {
     fn get_limit_alphabet(self_: PyRef<Self>) -> Option<usize> {
         getter!(self_, BpeTrainer, limit_alphabet)
     }
-
     #[setter]
     fn set_limit_alphabet(self_: PyRef<Self>, limit: Option<usize>) {
         setter!(self_, BpeTrainer, limit_alphabet, limit);
@@ -266,7 +272,6 @@ impl PyBpeTrainer {
     fn get_max_token_length(self_: PyRef<Self>) -> Option<usize> {
         getter!(self_, BpeTrainer, max_token_length)
     }
-
     #[setter]
     fn set_max_token_length(self_: PyRef<Self>, limit: Option<usize>) {
         setter!(self_, BpeTrainer, max_token_length, limit);
@@ -280,7 +285,6 @@ impl PyBpeTrainer {
             initial_alphabet.iter().map(|c| c.to_string()).collect()
         )
     }
-
     #[setter]
     fn set_initial_alphabet(self_: PyRef<Self>, alphabet: Vec<char>) {
         setter!(
@@ -295,7 +299,6 @@ impl PyBpeTrainer {
     fn get_continuing_subword_prefix(self_: PyRef<Self>) -> Option<String> {
         getter!(self_, BpeTrainer, continuing_subword_prefix.clone())
     }
-
     #[setter]
     fn set_continuing_subword_prefix(self_: PyRef<Self>, prefix: Option<String>) {
         setter!(self_, BpeTrainer, continuing_subword_prefix, prefix);
@@ -305,19 +308,74 @@ impl PyBpeTrainer {
     fn get_end_of_word_suffix(self_: PyRef<Self>) -> Option<String> {
         getter!(self_, BpeTrainer, end_of_word_suffix.clone())
     }
-
     #[setter]
     fn set_end_of_word_suffix(self_: PyRef<Self>, suffix: Option<String>) {
         setter!(self_, BpeTrainer, end_of_word_suffix, suffix);
     }
 
+    // ----- scoring / stop_by / track_ll -----
+
+    #[getter]
+    fn get_score_by(self_: PyRef<Self>) -> PyResult<String> {
+        let super_ = self_.as_ref();
+        let guard = super_.trainer.read().unwrap();
+        if let TrainerWrapper::BpeTrainer(ref tr) = *guard {
+            Ok(score_by_to_py(&tr.scoring).to_string())
+        } else {
+            unreachable!()
+        }
+    }
+    #[setter]
+    fn set_score_by(self_: PyRef<Self>, how: &str) -> PyResult<()> {
+        let sb = score_by_from_py(how)?;
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref mut tr) = *super_.trainer.write().unwrap() {
+            tr.scoring = sb;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn get_stop_by<'py>(self_: PyRef<'py, Self>, py: Python<'py>) -> PyResult<PyObject> {
+        let super_ = self_.as_ref();
+        let guard = super_.trainer.read().unwrap();
+        if let TrainerWrapper::BpeTrainer(ref tr) = *guard {
+            Ok(stop_by_to_py(py, &tr.stop_by))
+        } else {
+            unreachable!()
+        }
+    }
+    #[setter]
+    fn set_stop_by(self_: PyRef<Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let sb = stop_by_from_py(value)?;
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref mut tr) = *super_.trainer.write().unwrap() {
+            tr.stop_by = sb;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn get_track_ll(self_: PyRef<Self>) -> bool {
+        getter!(self_, BpeTrainer, track_ll)
+    }
+    #[setter]
+    fn set_track_ll(self_: PyRef<Self>, flag: bool) {
+        setter!(self_, BpeTrainer, track_ll, flag);
+    }
+
     #[new]
     #[pyo3(
         signature = (**kwargs),
-        text_signature = "(self, vocab_size=30000, min_frequency=0, show_progress=True, special_tokens=[], limit_alphabet=None, initial_alphabet=[], continuing_subword_prefix=None, end_of_word_suffix=None, max_token_length=None, words={})"
+        text_signature = "(self, vocab_size=30000, min_frequency=0, show_progress=True, special_tokens=[], limit_alphabet=None, initial_alphabet=[], continuing_subword_prefix=None, end_of_word_suffix=None, max_token_length=None, score_by='count', stop_by='vocab_size', track_ll=False)"
     )]
     pub fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::bpe::BpeTrainer::builder();
+
+        let mut score_by: Option<BpeScoreBy> = None;
+        let mut stop_by: Option<BpeStopBy> = None;
+        let mut track_ll: Option<bool> = None;
+
         if let Some(kwargs) = kwargs {
             for (key, val) in kwargs {
                 let key: String = key.extract()?;
@@ -361,52 +419,47 @@ impl PyBpeTrainer {
                         builder = builder.continuing_subword_prefix(val.extract()?)
                     }
                     "end_of_word_suffix" => builder = builder.end_of_word_suffix(val.extract()?),
+
+                    // new knobs
+                    "score_by" => {
+                        let s: String = val.extract()?;
+                        score_by = Some(score_by_from_py(&s)?);
+                    }
+                    "stop_by" => {
+                        stop_by = Some(stop_by_from_py(&val)?);
+                    }
+                    "track_ll" => {
+                        track_ll = Some(val.extract()?);
+                    }
                     _ => println!("Ignored unknown kwargs option {key}"),
                 };
             }
         }
+
+        if let Some(sb) = score_by {
+            builder = builder.score_by(sb);
+        }
+        if let Some(st) = stop_by {
+            builder = builder.stop_by(st);
+        }
+        if let Some(flag) = track_ll {
+            builder = builder.track_ll(flag);
+        }
+
         Ok((PyBpeTrainer {}, builder.build().into()))
     }
 }
 
-/// Trainer capable of training a WordPiece model
-///
-/// Args:
-///     vocab_size (:obj:`int`, `optional`):
-///         The size of the final vocabulary, including all tokens and alphabet.
-///
-///     min_frequency (:obj:`int`, `optional`):
-///         The minimum frequency a pair should have in order to be merged.
-///
-///     show_progress (:obj:`bool`, `optional`):
-///         Whether to show progress bars while training.
-///
-///     special_tokens (:obj:`List[Union[str, AddedToken]]`, `optional`):
-///         A list of special tokens the model should know of.
-///
-///     limit_alphabet (:obj:`int`, `optional`):
-///         The maximum different characters to keep in the alphabet.
-///
-///     initial_alphabet (:obj:`List[str]`, `optional`):
-///         A list of characters to include in the initial alphabet, even
-///         if not seen in the training dataset.
-///         If the strings contain more than one character, only the first one
-///         is kept.
-///
-///     continuing_subword_prefix (:obj:`str`, `optional`):
-///         A prefix to be used for every subword that is not a beginning-of-word.
-///
-///     end_of_word_suffix (:obj:`str`, `optional`):
-///         A suffix to be used for every subword that is a end-of-word.
+/// WordPiece trainer
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "WordPieceTrainer")]
 pub struct PyWordPieceTrainer {}
+
 #[pymethods]
 impl PyWordPieceTrainer {
     #[getter]
     fn get_vocab_size(self_: PyRef<Self>) -> usize {
         getter!(self_, WordPieceTrainer, vocab_size())
     }
-
     #[setter]
     fn set_vocab_size(self_: PyRef<Self>, vocab_size: usize) {
         setter!(self_, WordPieceTrainer, @set_vocab_size, vocab_size);
@@ -416,7 +469,6 @@ impl PyWordPieceTrainer {
     fn get_min_frequency(self_: PyRef<Self>) -> u64 {
         getter!(self_, WordPieceTrainer, min_frequency())
     }
-
     #[setter]
     fn set_min_frequency(self_: PyRef<Self>, freq: u64) {
         setter!(self_, WordPieceTrainer, @set_min_frequency, freq);
@@ -426,7 +478,6 @@ impl PyWordPieceTrainer {
     fn get_show_progress(self_: PyRef<Self>) -> bool {
         getter!(self_, WordPieceTrainer, show_progress())
     }
-
     #[setter]
     fn set_show_progress(self_: PyRef<Self>, show_progress: bool) {
         setter!(self_, WordPieceTrainer, @set_show_progress, show_progress);
@@ -443,7 +494,6 @@ impl PyWordPieceTrainer {
                 .collect()
         )
     }
-
     #[setter]
     fn set_special_tokens(self_: PyRef<Self>, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
         setter!(
@@ -473,7 +523,6 @@ impl PyWordPieceTrainer {
     fn get_limit_alphabet(self_: PyRef<Self>) -> Option<usize> {
         getter!(self_, WordPieceTrainer, limit_alphabet())
     }
-
     #[setter]
     fn set_limit_alphabet(self_: PyRef<Self>, limit: Option<usize>) {
         setter!(self_, WordPieceTrainer, @set_limit_alphabet, limit);
@@ -487,7 +536,6 @@ impl PyWordPieceTrainer {
             initial_alphabet().iter().map(|c| c.to_string()).collect()
         )
     }
-
     #[setter]
     fn set_initial_alphabet(self_: PyRef<Self>, alphabet: Vec<char>) {
         setter!(
@@ -502,7 +550,6 @@ impl PyWordPieceTrainer {
     fn get_continuing_subword_prefix(self_: PyRef<Self>) -> Option<String> {
         getter!(self_, WordPieceTrainer, continuing_subword_prefix().clone())
     }
-
     #[setter]
     fn set_continuing_subword_prefix(self_: PyRef<Self>, prefix: Option<String>) {
         setter!(self_, WordPieceTrainer, @set_continuing_subword_prefix, prefix);
@@ -512,7 +559,6 @@ impl PyWordPieceTrainer {
     fn get_end_of_word_suffix(self_: PyRef<Self>) -> Option<String> {
         getter!(self_, WordPieceTrainer, end_of_word_suffix().clone())
     }
-
     #[setter]
     fn set_end_of_word_suffix(self_: PyRef<Self>, suffix: Option<String>) {
         setter!(self_, WordPieceTrainer, @set_end_of_word_suffix, suffix);
@@ -576,29 +622,16 @@ impl PyWordPieceTrainer {
     }
 }
 
-/// Trainer capable of training a WorldLevel model
-///
-/// Args:
-///     vocab_size (:obj:`int`, `optional`):
-///         The size of the final vocabulary, including all tokens and alphabet.
-///
-///     min_frequency (:obj:`int`, `optional`):
-///         The minimum frequency a pair should have in order to be merged.
-///
-///     show_progress (:obj:`bool`, `optional`):
-///         Whether to show progress bars while training.
-///
-///     special_tokens (:obj:`List[Union[str, AddedToken]]`):
-///         A list of special tokens the model should know of.
+/// WordLevel trainer
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "WordLevelTrainer")]
 pub struct PyWordLevelTrainer {}
+
 #[pymethods]
 impl PyWordLevelTrainer {
     #[getter]
     fn get_vocab_size(self_: PyRef<Self>) -> usize {
         getter!(self_, WordLevelTrainer, vocab_size)
     }
-
     #[setter]
     fn set_vocab_size(self_: PyRef<Self>, vocab_size: usize) {
         setter!(self_, WordLevelTrainer, vocab_size, vocab_size);
@@ -608,7 +641,6 @@ impl PyWordLevelTrainer {
     fn get_min_frequency(self_: PyRef<Self>) -> u64 {
         getter!(self_, WordLevelTrainer, min_frequency)
     }
-
     #[setter]
     fn set_min_frequency(self_: PyRef<Self>, freq: u64) {
         setter!(self_, WordLevelTrainer, min_frequency, freq);
@@ -618,7 +650,6 @@ impl PyWordLevelTrainer {
     fn get_show_progress(self_: PyRef<Self>) -> bool {
         getter!(self_, WordLevelTrainer, show_progress)
     }
-
     #[setter]
     fn set_show_progress(self_: PyRef<Self>, show_progress: bool) {
         setter!(self_, WordLevelTrainer, show_progress, show_progress);
@@ -635,7 +666,6 @@ impl PyWordLevelTrainer {
                 .collect()
         )
     }
-
     #[setter]
     fn set_special_tokens(self_: PyRef<Self>, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
         setter!(
@@ -718,46 +748,16 @@ impl PyWordLevelTrainer {
     }
 }
 
-/// Trainer capable of training a Unigram model
-///
-/// Args:
-///     vocab_size (:obj:`int`):
-///         The size of the final vocabulary, including all tokens and alphabet.
-///
-///     show_progress (:obj:`bool`):
-///         Whether to show progress bars while training.
-///
-///     special_tokens (:obj:`List[Union[str, AddedToken]]`):
-///         A list of special tokens the model should know of.
-///
-///     initial_alphabet (:obj:`List[str]`):
-///         A list of characters to include in the initial alphabet, even
-///         if not seen in the training dataset.
-///         If the strings contain more than one character, only the first one
-///         is kept.
-///
-///     shrinking_factor (:obj:`float`):
-///         The shrinking factor used at each step of the training to prune the
-///         vocabulary.
-///
-///     unk_token (:obj:`str`):
-///         The token used for out-of-vocabulary tokens.
-///
-///     max_piece_length (:obj:`int`):
-///         The maximum length of a given token.
-///
-///     n_sub_iterations (:obj:`int`):
-///         The number of iterations of the EM algorithm to perform before
-///         pruning the vocabulary.
+/// Unigram trainer
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "UnigramTrainer")]
 pub struct PyUnigramTrainer {}
+
 #[pymethods]
 impl PyUnigramTrainer {
     #[getter]
     fn get_vocab_size(self_: PyRef<Self>) -> u32 {
         getter!(self_, UnigramTrainer, vocab_size)
     }
-
     #[setter]
     fn set_vocab_size(self_: PyRef<Self>, vocab_size: u32) {
         setter!(self_, UnigramTrainer, vocab_size, vocab_size);
@@ -767,7 +767,6 @@ impl PyUnigramTrainer {
     fn get_show_progress(self_: PyRef<Self>) -> bool {
         getter!(self_, UnigramTrainer, show_progress)
     }
-
     #[setter]
     fn set_show_progress(self_: PyRef<Self>, show_progress: bool) {
         setter!(self_, UnigramTrainer, show_progress, show_progress);
@@ -784,7 +783,6 @@ impl PyUnigramTrainer {
                 .collect()
         )
     }
-
     #[setter]
     fn set_special_tokens(self_: PyRef<Self>, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
         setter!(
@@ -818,7 +816,6 @@ impl PyUnigramTrainer {
             initial_alphabet.iter().map(|c| c.to_string()).collect()
         )
     }
-
     #[setter]
     fn set_initial_alphabet(self_: PyRef<Self>, alphabet: Vec<char>) {
         setter!(

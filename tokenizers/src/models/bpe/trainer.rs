@@ -11,17 +11,94 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-#[derive(Debug, Eq)]
+
+// NEW: scoring and stopping policies + small math helpers
+/// How to score candidate merges during training.
+///
+/// * `Count` — legacy BPE: pick the most frequent pair.
+/// * `GreedyLLExact` — score by the *exact* ΔLL (closed-form, using current counts).
+/// * `GreedyLLApprox` — score by the first-order approximation n_bc * log(n_bc * N / (n_b * n_c)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BpeScoreBy {
+    #[serde(rename = "count")]
+    Count,
+    #[serde(rename = "greedy_ll_exact")]
+    GreedyLLExact,
+    #[serde(rename = "greedy_ll_approx")]
+    GreedyLLApprox,
+}
+
+/// When to stop training.
+///
+/// * `VocabSize` — legacy BPE: stop when vocab_size reached.
+/// * `DeltaLLExact` — stop when the best achievable exact ΔLL ≤ 0.
+/// * `DeltaLLApprox` — stop when the best achievable approx ΔLL ≤ 0.
+///
+/// Note: stopping criterion is evaluated *globally*. We maintain a separate
+/// heap for stop scores so that one can, for example, select by `Count` but
+/// still stop by a ΔLL rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BpeStopBy {
+    #[serde(rename = "vocab_size")]
+    VocabSize,
+    #[serde(rename = "delta_ll_exact")]
+    DeltaLLExact,
+    #[serde(rename = "delta_ll_approx")]
+    DeltaLLApprox,
+}
+
+#[inline]
+fn xlogx(x: u64) -> f64 {
+    if x == 0 {
+        0.0
+    } else {
+        let f = x as f64;
+        f * f.ln()
+    }
+}
+
+#[inline]
+fn delta_ll_exact(nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
+    // ΔLL(b,c) = (nb - nbc)log(nb - nbc) - nb log nb
+    //          + (nc - nbc)log(nc - nbc) - nc log nc
+    //          + nbc log nbc
+    //          - (N - nbc)log(N - nbc) + N log N
+    xlogx(nb.saturating_sub(nbc))
+        - xlogx(nb)
+        + xlogx(nc.saturating_sub(nbc))
+        - xlogx(nc)
+        + xlogx(nbc)
+        - xlogx(n.saturating_sub(nbc))
+        + xlogx(n)
+}
+
+#[inline]
+fn delta_ll_approx(nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
+    if nbc == 0 || nb == 0 || nc == 0 {
+        0.0
+    } else {
+        let num = (nbc as f64) * (n as f64);
+        let den = (nb as f64) * (nc as f64);
+        (nbc as f64) * (num / den).ln()
+    }
+}
+
+// CHANGED: Merge item now carries a `score` so we can order by the policy
+#[derive(Debug)]
 struct Merge {
     pair: Pair,
     count: u64,
+    score: f64, // NEW: priority according to `score_by`
     pos: AHashSet<usize>,
 }
 impl PartialEq for Merge {
     fn eq(&self, other: &Self) -> bool {
-        self.count == other.count && self.pair == other.pair
+        self.count == other.count && self.pair == other.pair && self.score.to_bits() == other.score.to_bits()
     }
 }
+// FIX: implement Eq explicitly so we can also implement Ord
+impl Eq for Merge {}
+
 impl PartialOrd for Merge {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -29,11 +106,44 @@ impl PartialOrd for Merge {
 }
 impl Ord for Merge {
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.count != other.count {
-            self.count.cmp(&other.count)
-        } else {
-            // Here we want ascending order
-            other.pair.cmp(&self.pair)
+        // Max-heap by score; when equal use same tie-breaker as original BPE
+        match self
+            .score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+        {
+            Ordering::Equal => other.pair.cmp(&self.pair),
+            ord => ord,
+        }
+    }
+}
+
+// NEW: Separate "best stop" heap item (for global ΔLL stopping)
+#[derive(Debug, Copy, Clone)]
+struct BestItem {
+    pair: Pair,
+    score: f64,
+}
+impl Eq for BestItem {}
+impl PartialEq for BestItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.pair == other.pair && self.score.to_bits() == other.score.to_bits()
+    }
+}
+impl PartialOrd for BestItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BestItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self
+            .score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+        {
+            Ordering::Equal => other.pair.cmp(&self.pair),
+            ord => ord,
         }
     }
 }
@@ -48,6 +158,11 @@ struct Config {
     continuing_subword_prefix: Option<String>,
     end_of_word_suffix: Option<String>,
     max_token_length: Option<usize>,
+
+    // NEW:
+    scoring: BpeScoreBy,
+    stop_by: BpeStopBy,
+    track_ll: bool, // reserved knob; recording is wired in trainer, exposure handled elsewhere
 }
 
 /// A `BpeTrainerBuilder` can be used to create a `BpeTrainer` with a custom
@@ -69,6 +184,11 @@ impl Default for BpeTrainerBuilder {
                 continuing_subword_prefix: None,
                 end_of_word_suffix: None,
                 max_token_length: None,
+
+                // NEW defaults: match legacy behavior
+                scoring: BpeScoreBy::Count,
+                stop_by: BpeStopBy::VocabSize,
+                track_ll: false,
             },
         }
     }
@@ -144,6 +264,29 @@ impl BpeTrainerBuilder {
         self
     }
 
+    // NEW builder knobs
+
+    /// Select how to score merges (`"count" | "greedy_ll_exact" | "greedy_ll_approx"`).
+    #[must_use]
+    pub fn score_by(mut self, scoring: BpeScoreBy) -> Self {
+        self.config.scoring = scoring;
+        self
+    }
+
+    /// Select how to stop (`"vocab_size" | "delta_ll_exact" | "delta_ll_approx"`).
+    #[must_use]
+    pub fn stop_by(mut self, stop_by: BpeStopBy) -> Self {
+        self.config.stop_by = stop_by;
+        self
+    }
+
+    /// Toggle tracking total LL during training (kept here; exposure handled elsewhere).
+    #[must_use]
+    pub fn track_ll(mut self, track_ll: bool) -> Self {
+        self.config.track_ll = track_ll;
+        self
+    }
+
     /// Constructs the final BpeTrainer
     pub fn build(self) -> BpeTrainer {
         BpeTrainer {
@@ -156,6 +299,12 @@ impl BpeTrainerBuilder {
             continuing_subword_prefix: self.config.continuing_subword_prefix,
             end_of_word_suffix: self.config.end_of_word_suffix,
             max_token_length: self.config.max_token_length,
+
+            // NEW
+            scoring: self.config.scoring,
+            stop_by: self.config.stop_by,
+            track_ll: self.config.track_ll,
+
             words: AHashMap::new(),
         }
     }
@@ -199,6 +348,11 @@ pub struct BpeTrainer {
     pub end_of_word_suffix: Option<String>,
     /// An optional parameter to limit the max length of any single token
     pub max_token_length: Option<usize>,
+
+    // NEW: knobs visible on the trainer
+    pub scoring: BpeScoreBy,
+    pub stop_by: BpeStopBy,
+    pub track_ll: bool,
 
     words: AHashMap<CompactString, u64>,
 }
@@ -451,37 +605,139 @@ impl BpeTrainer {
         //
         self.update_progress(&progress, words.len(), "Count pairs");
         let (mut pair_counts, mut where_to_update) = self.count_pairs(&words, &counts, &progress);
-        // Insert them in the queue
+
+        // NEW: compute current symbol counts (n_t) and total tokens N
+        let mut sym_counts: AHashMap<u32, u64> = AHashMap::new();
+        let mut total_tokens: u64 = 0;
+        for (w, &cnt) in words.iter().zip(&counts) {
+            let chars = w.get_chars();
+            total_tokens += (chars.len() as u64) * cnt as u64;
+            for c in chars {
+                *sym_counts.entry(c).or_default() += cnt as u64;
+            }
+        }
+
+        // Insert pairs in the selection queue (score depends on policy)
         let mut queue = OctonaryHeap::with_capacity(pair_counts.len());
+
+        // Also prepare global stopping heap if stop_by != VocabSize
+        let use_delta_stop = !matches!(self.stop_by, BpeStopBy::VocabSize);
+        let mut stop_heap = OctonaryHeap::with_capacity(pair_counts.len());
+        let mut stop_scores: AHashMap<Pair, f64> = AHashMap::new();
+
         where_to_update.drain().for_each(|(pair, pos)| {
             let count = pair_counts[&pair];
             if count > 0 {
+                let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
+                let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
+                let sel_score = match self.scoring {
+                    BpeScoreBy::Count => count as f64,
+                    BpeScoreBy::GreedyLLExact => delta_ll_exact(nb, nc, count as u64, total_tokens),
+                    BpeScoreBy::GreedyLLApprox => {
+                        delta_ll_approx(nb, nc, count as u64, total_tokens)
+                    }
+                };
                 queue.push(Merge {
                     pair,
                     count: count as u64,
+                    score: sel_score,
                     pos,
                 });
+
+                if use_delta_stop {
+                    let s = match self.stop_by {
+                        BpeStopBy::DeltaLLExact => {
+                            delta_ll_exact(nb, nc, count as u64, total_tokens)
+                        }
+                        BpeStopBy::DeltaLLApprox => {
+                            delta_ll_approx(nb, nc, count as u64, total_tokens)
+                        }
+                        BpeStopBy::VocabSize => 0.0,
+                    };
+                    stop_heap.push(BestItem { pair, score: s });
+                    stop_scores.insert(pair, s);
+                }
             }
         });
         self.finalize_progress(&progress, words.len());
 
-        //
         // 5. Do merges
-        //
         self.update_progress(&progress, self.vocab_size, "Compute merges");
         let mut merges: Vec<(Pair, u32)> = vec![];
+
+        // Optional: track LL history locally (exposure handled elsewhere)
+        let mut _ll_history: Vec<f64> = Vec::new();
+        if self.track_ll {
+            // LL = sum_t n_t log n_t  -  N log N
+            let sum = sym_counts.values().copied().map(xlogx).sum::<f64>();
+            _ll_history.push(sum - xlogx(total_tokens));
+        }
+
         loop {
-            // Stop as soon as we have a big enough vocabulary
+            // Legacy: stop when vocab size reached
             if word_to_id.len() >= self.vocab_size {
                 break;
             }
 
+            // Optional: global ΔLL stopping (independent of selection policy)
+            if use_delta_stop {
+                // Pull until we find a consistent top according to current counts
+                let mut top_stop: Option<BestItem> = None;
+                while let Some(mut cand) = stop_heap.pop() {
+                    // Skip if the pair disappeared
+                    let cur_cnt = pair_counts.get(&cand.pair).copied().unwrap_or(0) as u64;
+                    if cur_cnt == 0 {
+                        stop_scores.remove(&cand.pair);
+                        continue;
+                    }
+                    let nb = *sym_counts.get(&cand.pair.0).unwrap_or(&0);
+                    let nc = *sym_counts.get(&cand.pair.1).unwrap_or(&0);
+                    let refreshed = match self.stop_by {
+                        BpeStopBy::DeltaLLExact => delta_ll_exact(nb, nc, cur_cnt, total_tokens),
+                        BpeStopBy::DeltaLLApprox => {
+                            delta_ll_approx(nb, nc, cur_cnt, total_tokens)
+                        }
+                        BpeStopBy::VocabSize => 0.0,
+                    };
+                    // If stale, push back refreshed; otherwise accept it
+                    if (refreshed - cand.score).abs() > 1e-12 {
+                        cand.score = refreshed;
+                        stop_scores.insert(cand.pair, refreshed);
+                        stop_heap.push(cand);
+                    } else {
+                        top_stop = Some(cand);
+                        stop_heap.push(cand);
+                        break;
+                    }
+                }
+                if let Some(best) = top_stop {
+                    if best.score <= 0.0 {
+                        break;
+                    }
+                }
+            }
+
+            // Selection heap
             let Some(mut top) = queue.pop() else {
                 break;
             };
 
-            if top.count != pair_counts[&top.pair] as u64 {
-                top.count = pair_counts[&top.pair] as u64;
+            // Refresh staleness: both count and score may have changed
+            let cur_count = pair_counts.get(&top.pair).copied().unwrap_or(0) as u64;
+            if cur_count == 0 {
+                // Pair disappeared; skip
+                continue;
+            }
+            let nb = *sym_counts.get(&top.pair.0).unwrap_or(&0);
+            let nc = *sym_counts.get(&top.pair.1).unwrap_or(&0);
+            let cur_score = match self.scoring {
+                BpeScoreBy::Count => cur_count as f64,
+                BpeScoreBy::GreedyLLExact => delta_ll_exact(nb, nc, cur_count, total_tokens),
+                BpeScoreBy::GreedyLLApprox => delta_ll_approx(nb, nc, cur_count, total_tokens),
+            };
+            if cur_count != top.count || (cur_score - top.score).abs() > 1e-12 {
+                top.count = cur_count;
+                top.score = cur_score;
                 queue.push(top);
                 continue;
             }
@@ -543,7 +799,7 @@ impl BpeTrainer {
                 })
                 .collect::<Vec<_>>();
 
-            // Introduce new formed pairs
+            // Introduce new formed pairs; accumulate where_to_update
             for ((pair, change), iw) in changes {
                 let count = change * counts[iw] as i32;
                 *pair_counts.entry(pair).or_default() += count;
@@ -551,14 +807,57 @@ impl BpeTrainer {
                     where_to_update.entry(pair).or_default().insert(iw);
                 }
             }
+
+            // NEW: recompute symbol counts and total tokens exactly from `words`
+            sym_counts.clear();
+            total_tokens = 0;
+            for (w, &cnt) in words.iter().zip(&counts) {
+                let cs = w.get_chars();
+                total_tokens += (cs.len() as u64) * cnt as u64;
+                for c in cs {
+                    *sym_counts.entry(c).or_default() += cnt as u64;
+                }
+            }
+            if self.track_ll {
+                let sum = sym_counts.values().copied().map(xlogx).sum::<f64>();
+                _ll_history.push(sum - xlogx(total_tokens));
+            }
+
+            // Refill both heaps with updated scores for changed pairs
             where_to_update.drain().for_each(|(pair, pos)| {
                 let count = pair_counts[&pair];
                 if count > 0 {
+                    let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
+                    let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
+                    let sel_score = match self.scoring {
+                        BpeScoreBy::Count => count as f64,
+                        BpeScoreBy::GreedyLLExact => {
+                            delta_ll_exact(nb, nc, count as u64, total_tokens)
+                        }
+                        BpeScoreBy::GreedyLLApprox => {
+                            delta_ll_approx(nb, nc, count as u64, total_tokens)
+                        }
+                    };
                     queue.push(Merge {
                         pair,
                         count: count as u64,
+                        score: sel_score,
                         pos,
                     });
+
+                    if use_delta_stop {
+                        let s = match self.stop_by {
+                            BpeStopBy::DeltaLLExact => {
+                                delta_ll_exact(nb, nc, count as u64, total_tokens)
+                            }
+                            BpeStopBy::DeltaLLApprox => {
+                                delta_ll_approx(nb, nc, count as u64, total_tokens)
+                            }
+                            BpeStopBy::VocabSize => 0.0,
+                        };
+                        stop_scores.insert(pair, s);
+                        stop_heap.push(BestItem { pair, score: s });
+                    }
                 }
             });
 

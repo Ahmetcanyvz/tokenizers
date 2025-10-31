@@ -632,6 +632,7 @@ mod tests {
             ]
         );
     }
+    // CHECK
     #[test]
     fn test_unk_get_fused() {
         let vocab: Vocab = [("<unk>".into(), 0), ("a".into(), 1), ("b".into(), 2)]

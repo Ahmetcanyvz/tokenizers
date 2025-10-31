@@ -158,7 +158,7 @@ impl Word {
 
         changes
     }
-
+    // Heap-based implementation of BPE merges
     pub(super) fn merge_all(&mut self, merges: &AHashMap<Pair, (u32, u32)>, dropout: Option<f32>) {
         let mut queue = QuaternaryHeap::with_capacity(self.symbols.len());
         let mut skip = Vec::with_capacity(queue.len());
