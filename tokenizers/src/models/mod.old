@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::models::bpe::{BpeTrainer, BPE};
-use crate::models::unigram::{CompressionTrainer, Unigram, UnigramTrainer}; // + CompressionTrainer
+use crate::models::unigram::{Unigram, UnigramTrainer};
 use crate::models::wordlevel::{WordLevel, WordLevelTrainer};
 use crate::models::wordpiece::{WordPiece, WordPieceTrainer};
 use crate::{AddedToken, Model, Result, Token, Trainer};
@@ -231,7 +231,6 @@ pub enum TrainerWrapper {
     WordPieceTrainer(WordPieceTrainer),
     WordLevelTrainer(WordLevelTrainer),
     UnigramTrainer(UnigramTrainer),
-    CompressionTrainer(CompressionTrainer), // NEW: greedy compression trainer
 }
 
 impl Trainer for TrainerWrapper {
@@ -243,7 +242,6 @@ impl Trainer for TrainerWrapper {
             Self::WordPieceTrainer(wpt) => wpt.should_show_progress(),
             Self::WordLevelTrainer(wpt) => wpt.should_show_progress(),
             Self::UnigramTrainer(wpt) => wpt.should_show_progress(),
-            Self::CompressionTrainer(ct) => ct.should_show_progress(),
         }
     }
 
@@ -265,10 +263,6 @@ impl Trainer for TrainerWrapper {
                 ModelWrapper::Unigram(u) => t.train(u),
                 _ => Err("UnigramTrainer can only train a Unigram".into()),
             },
-            Self::CompressionTrainer(t) => match model {
-                ModelWrapper::Unigram(u) => t.train(u),
-                _ => Err("CompressionTrainer can only train a Unigram".into()),
-            },
         }
     }
 
@@ -283,7 +277,6 @@ impl Trainer for TrainerWrapper {
             Self::WordPieceTrainer(wpt) => wpt.feed(iterator, process),
             Self::WordLevelTrainer(wpt) => wpt.feed(iterator, process),
             Self::UnigramTrainer(wpt) => wpt.feed(iterator, process),
-            Self::CompressionTrainer(ct) => ct.feed(iterator, process),
         }
     }
 }
@@ -292,7 +285,6 @@ impl_enum_from!(BpeTrainer, TrainerWrapper, BpeTrainer);
 impl_enum_from!(WordPieceTrainer, TrainerWrapper, WordPieceTrainer);
 impl_enum_from!(UnigramTrainer, TrainerWrapper, UnigramTrainer);
 impl_enum_from!(WordLevelTrainer, TrainerWrapper, WordLevelTrainer);
-impl_enum_from!(CompressionTrainer, TrainerWrapper, CompressionTrainer); // From<CompressionTrainer> for TrainerWrapper
 
 #[cfg(test)]
 mod tests {

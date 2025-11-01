@@ -1,0 +1,110 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "Unigram",
+    "unk_id": null,
+    "vocab": [
+      [
+        " ",
+        -1.0
+      ],
+      [
+        "b",
+        -1.0
+      ],
+      [
+        "a",
+        -1.0
+      ],
+      [
+        "c",
+        -1.0
+      ],
+      [
+        "d",
+        -1.0
+      ],
+      [
+        "z",
+        -1.0
+      ],
+      [
+        "y",
+        -1.0
+      ],
+      [
+        "x",
+        -1.0
+      ],
+      [
+        "cd ab",
+        -1.0
+      ],
+      [
+        "abcd ab",
+        -1.0
+      ],
+      [
+        "d ab",
+        -1.0
+      ],
+      [
+        "cd abc",
+        -1.0
+      ],
+      [
+        "bcd ab",
+        -1.0
+      ],
+      [
+        "abcd",
+        -1.0
+      ],
+      [
+        "abc",
+        -1.0
+      ],
+      [
+        "ab",
+        -1.0
+      ],
+      [
+        " abc",
+        -1.0
+      ],
+      [
+        " ab",
+        -1.0
+      ],
+      [
+        "d abc",
+        -1.0
+      ],
+      [
+        " abcd",
+        -1.0
+      ],
+      [
+        "bcd",
+        -1.0
+      ],
+      [
+        "cd",
+        -1.0
+      ],
+      [
+        "bc",
+        -1.0
+      ]
+    ],
+    "byte_fallback": false,
+    "unit_cost": false
+  }
+}

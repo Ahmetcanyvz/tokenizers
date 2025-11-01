@@ -33,7 +33,6 @@ pub struct PyModel {
 }
 
 impl PyModel {
-    /// Return the Python-side sub-type corresponding to the inner Rust `ModelWrapper` variant.
     pub(crate) fn get_as_subtype(&self, py: Python<'_>) -> PyResult<PyObject> {
         let base = self.clone();
         Ok(match *self.model.as_ref().read().unwrap() {
@@ -338,14 +337,6 @@ macro_rules! setter {
         let mut model = super_.model.write().unwrap();
         if let ModelWrapper::$variant(ref mut mo) = *model {
             mo.$name = $value;
-        }
-    }};
-    // Call-style setter (for methods like `set_unit_cost(bool)`)
-    ($self: ident, $variant: ident, @$name: ident, $value: expr) => {{
-        let super_ = $self.as_ref();
-        let mut model = super_.model.write().unwrap();
-        if let ModelWrapper::$variant(ref mut mo) = *model {
-            mo.$name($value);
         }
     }};
 }
@@ -907,19 +898,6 @@ impl PyUnigram {
                 "`vocab` and `unk_id` must be both specified",
             )),
         }
-    }
-
-    /// Get or set whether the Unigram model decodes under **unit-cost** (all tokens cost 1).
-    /// This is useful when training with the compression-based trainer.
-    #[getter]
-    fn get_unit_cost(self_: PyRef<Self>) -> bool {
-        getter!(self_, Unigram, unit_cost())
-    }
-
-    #[setter]
-    fn set_unit_cost(self_: PyRef<Self>, unit_cost: bool) {
-        // Call the Rust-side method `set_unit_cost(bool)`
-        setter!(self_, Unigram, @set_unit_cost, unit_cost);
     }
 
     /// Clears the internal cache

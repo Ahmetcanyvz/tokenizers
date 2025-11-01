@@ -45,11 +45,6 @@ impl PyTrainer {
                 .into_pyobject(py)?
                 .into_any()
                 .into(),
-            // NEW: surface the CompressionTrainer subtype in Python
-            TrainerWrapper::CompressionTrainer(_) => Py::new(py, (PyCompressionTrainer {}, base))?
-                .into_pyobject(py)?
-                .into_any()
-                .into(),
         })
     }
 }
@@ -723,7 +718,7 @@ impl PyWordLevelTrainer {
     }
 }
 
-/// Trainer capable of training a Unigram model (EM-based)
+/// Trainer capable of training a Unigram model
 ///
 /// Args:
 ///     vocab_size (:obj:`int`):
@@ -896,202 +891,6 @@ impl PyUnigramTrainer {
     }
 }
 
-/// Trainer capable of training a Unigram model by **compression maximization**
-/// (greedy deletion with affected-sentences-only resegmentation).
-///
-/// Args:
-///     vocab_size (:obj:`int`):
-///         Target final vocabulary size (includes special tokens).
-///     show_progress (:obj:`bool`):
-///         Whether to show progress bars during training.
-///     special_tokens (:obj:`List[Union[str, AddedToken]]`):
-///         Special tokens that are kept and never deleted.
-///     initial_alphabet (:obj:`List[str]`):
-///         Characters to force-include in Σ, even if not present in data.
-///     max_piece_length (:obj:`int`):
-///         Maximum token length considered when seeding substrings.
-///     seed_size (:obj:`int`):
-///         Upper bound on the number of seed candidates.
-///     seed_vocab (:obj:`List[str]`, optional):
-///         If provided, force the initial seed vocabulary to exactly these tokens.
-#[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "CompressionTrainer")]
-pub struct PyCompressionTrainer {}
-
-#[pymethods]
-impl PyCompressionTrainer {
-    // ---- Basic getters/setters wired with the standard macros ----
-    #[getter]
-    fn get_vocab_size(self_: PyRef<Self>) -> u32 {
-        getter!(self_, CompressionTrainer, vocab_size)
-    }
-
-    #[setter]
-    fn set_vocab_size(self_: PyRef<Self>, vocab_size: u32) {
-        setter!(self_, CompressionTrainer, vocab_size, vocab_size);
-    }
-
-    #[getter]
-    fn get_show_progress(self_: PyRef<Self>) -> bool {
-        getter!(self_, CompressionTrainer, show_progress)
-    }
-
-    #[setter]
-    fn set_show_progress(self_: PyRef<Self>, show_progress: bool) {
-        setter!(self_, CompressionTrainer, show_progress, show_progress);
-    }
-
-    #[getter]
-    fn get_max_piece_length(self_: PyRef<Self>) -> usize {
-        getter!(self_, CompressionTrainer, max_piece_length)
-    }
-
-    #[setter]
-    fn set_max_piece_length(self_: PyRef<Self>, v: usize) {
-        setter!(self_, CompressionTrainer, max_piece_length, v);
-    }
-
-    #[getter]
-    fn get_seed_size(self_: PyRef<Self>) -> usize {
-        getter!(self_, CompressionTrainer, seed_size)
-    }
-
-    #[setter]
-    fn set_seed_size(self_: PyRef<Self>, v: usize) {
-        setter!(self_, CompressionTrainer, seed_size, v);
-    }
-
-    #[getter]
-    fn get_initial_alphabet(self_: PyRef<Self>) -> Vec<String> {
-        getter!(
-            self_,
-            CompressionTrainer,
-            initial_alphabet.iter().map(|c| c.to_string()).collect()
-        )
-    }
-
-    #[setter]
-    fn set_initial_alphabet(self_: PyRef<Self>, alphabet: Vec<char>) {
-        setter!(
-            self_,
-            CompressionTrainer,
-            initial_alphabet,
-            alphabet.into_iter().collect()
-        );
-    }
-
-    #[getter]
-    fn get_special_tokens(self_: PyRef<Self>) -> Vec<PyAddedToken> {
-        getter!(
-            self_,
-            CompressionTrainer,
-            special_tokens
-                .iter()
-                .map(|tok| tok.clone().into())
-                .collect()
-        )
-    }
-
-    #[setter]
-    fn set_special_tokens(self_: PyRef<Self>, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
-        setter!(
-            self_,
-            CompressionTrainer,
-            special_tokens,
-            special_tokens
-                .into_iter()
-                .map(|token| {
-                    if let Ok(content) = token.extract::<String>() {
-                        Ok(tk::tokenizer::AddedToken::from(content, true))
-                    } else if let Ok(mut token) = token.extract::<PyRefMut<PyAddedToken>>() {
-                        token.special = true;
-                        Ok(token.get_token())
-                    } else {
-                        Err(exceptions::PyTypeError::new_err(
-                            "Special tokens must be a List[Union[str, AddedToken]]",
-                        ))
-                    }
-                })
-                .collect::<PyResult<Vec<_>>>()?
-        );
-        Ok(())
-    }
-
-    // ---- Python constructor ----
-    #[new]
-    #[pyo3(
-        signature = (**kwargs),
-        text_signature = "(self, vocab_size=8000, show_progress=True, special_tokens=[], initial_alphabet=[], max_piece_length=16, seed_size=1000000, seed_vocab=None)"
-    )]
-    pub fn new(kwargs: Option<Bound<'_, PyDict>>) -> PyResult<(Self, PyTrainer)> {
-        let mut builder = tk::models::unigram::CompressionTrainer::builder();
-
-        if let Some(kwargs) = kwargs {
-            for (key, val) in kwargs {
-                let key: String = key.extract()?;
-                match key.as_ref() {
-                    "vocab_size" => {
-                        builder.vocab_size(val.extract()?);
-                    }
-                    "show_progress" => {
-                        builder.show_progress(val.extract()?);
-                    }
-                    "max_piece_length" => {
-                        builder.max_piece_length(val.extract()?);
-                    }
-                    "seed_size" => {
-                        builder.seed_size(val.extract()?);
-                    }
-                    "initial_alphabet" => {
-                        let alphabet: Vec<String> = val.extract()?;
-                        builder.initial_alphabet(
-                            alphabet
-                                .into_iter()
-                                .filter_map(|s| s.chars().next())
-                                .collect(),
-                        );
-                    }
-                    "special_tokens" => {
-                        builder.special_tokens(
-                            val.downcast::<PyList>()?
-                                .into_iter()
-                                .map(|token| {
-                                    if let Ok(content) = token.extract::<String>() {
-                                        Ok(PyAddedToken::from(content, Some(true)).get_token())
-                                    } else if let Ok(mut token) =
-                                        token.extract::<PyRefMut<PyAddedToken>>()
-                                    {
-                                        token.special = true;
-                                        Ok(token.get_token())
-                                    } else {
-                                        Err(exceptions::PyTypeError::new_err(
-                                            "special_tokens must be a List[Union[str, AddedToken]]",
-                                        ))
-                                    }
-                                })
-                                .collect::<PyResult<Vec<_>>>()?,
-                        );
-                    }
-                    // NEW: allow passing an exact seed vocabulary from Python
-                    "seed_vocab" => {
-                        let sv: Option<Vec<String>> = val.extract()?;
-                        builder.seed_vocab(sv);
-                    }
-                    _ => println!("Ignored unknown kwargs option {key}"),
-                }
-            }
-        }
-
-        // Build the Rust trainer and wrap it in PyTrainer using the generic `From` impl
-        let trainer: tokenizers::models::unigram::CompressionTrainer =
-            builder.build().map_err(|e| {
-                exceptions::PyException::new_err(format!(
-                    "Cannot build CompressionTrainer: {e}"
-                ))
-            })?;
-        Ok((PyCompressionTrainer {}, trainer.into()))
-    }
-}
-
 /// Trainers Module
 #[pymodule]
 pub fn trainers(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1100,8 +899,6 @@ pub fn trainers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordPieceTrainer>()?;
     m.add_class::<PyWordLevelTrainer>()?;
     m.add_class::<PyUnigramTrainer>()?;
-    // NEW: export the compression-based trainer in the Python API
-    m.add_class::<PyCompressionTrainer>()?;
     Ok(())
 }
 
