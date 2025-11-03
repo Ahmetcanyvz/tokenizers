@@ -53,6 +53,7 @@ impl PyTrainer {
         })
     }
 }
+
 #[pymethods]
 impl PyTrainer {
     fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
@@ -657,7 +658,7 @@ impl PyWordLevelTrainer {
                         Ok(token.get_token())
                     } else {
                         Err(exceptions::PyTypeError::new_err(
-                            "Special tokens must be a List[Union[str, AddedToken]]",
+                            "special_tokens must be a List[Union[str, AddedToken]]",
                         ))
                     }
                 })
@@ -888,10 +889,9 @@ impl PyUnigramTrainer {
             }
         }
 
-        let trainer: tokenizers::models::unigram::UnigramTrainer =
-            builder.build().map_err(|e| {
-                exceptions::PyException::new_err(format!("Cannot build UnigramTrainer: {e}"))
-            })?;
+        let trainer: tokenizers::models::unigram::UnigramTrainer = builder.build().map_err(|e| {
+            exceptions::PyException::new_err(format!("Cannot build UnigramTrainer: {e}"))
+        })?;
         Ok((PyUnigramTrainer {}, trainer.into()))
     }
 }
@@ -914,6 +914,16 @@ impl PyUnigramTrainer {
 ///         Upper bound on the number of seed candidates.
 ///     seed_vocab (:obj:`List[str]`, optional):
 ///         If provided, force the initial seed vocabulary to exactly these tokens.
+///     prune_ratio (:obj:`float`, optional):
+///         Per-iteration batch prune ratio in [0,1] (ceil(prune_ratio * remaining)).
+///     min_prune (:obj:`int`, optional):
+///         Minimum tokens to prune per iteration (default 1).
+///     batch_recompute (:obj:`bool`, optional):
+///         If True (default), recompute Δ after each deletion; otherwise delete top-K based on a single pass.
+///     byte_fallback (:obj:`bool`, optional):
+///         If True, enable Unigram byte fallback in produced model.
+///     keep_byte_fallback (:obj:`bool`, optional):
+///         If True (default), treat fallback tokens (if any) as non-deletable.
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "CompressionTrainer")]
 pub struct PyCompressionTrainer {}
 
@@ -958,6 +968,56 @@ impl PyCompressionTrainer {
     #[setter]
     fn set_seed_size(self_: PyRef<Self>, v: usize) {
         setter!(self_, CompressionTrainer, seed_size, v);
+    }
+
+    #[getter]
+    fn get_prune_ratio(self_: PyRef<Self>) -> f32 {
+        getter!(self_, CompressionTrainer, prune_ratio)
+    }
+
+    #[setter]
+    fn set_prune_ratio(self_: PyRef<Self>, r: f32) {
+        setter!(self_, CompressionTrainer, prune_ratio, r);
+    }
+
+    #[getter]
+    fn get_min_prune(self_: PyRef<Self>) -> usize {
+        getter!(self_, CompressionTrainer, min_prune)
+    }
+
+    #[setter]
+    fn set_min_prune(self_: PyRef<Self>, k: usize) {
+        setter!(self_, CompressionTrainer, min_prune, k);
+    }
+
+    #[getter]
+    fn get_batch_recompute(self_: PyRef<Self>) -> bool {
+        getter!(self_, CompressionTrainer, batch_recompute)
+    }
+
+    #[setter]
+    fn set_batch_recompute(self_: PyRef<Self>, v: bool) {
+        setter!(self_, CompressionTrainer, batch_recompute, v);
+    }
+
+    #[getter]
+    fn get_byte_fallback(self_: PyRef<Self>) -> bool {
+        getter!(self_, CompressionTrainer, byte_fallback)
+    }
+
+    #[setter]
+    fn set_byte_fallback(self_: PyRef<Self>, v: bool) {
+        setter!(self_, CompressionTrainer, byte_fallback, v);
+    }
+
+    #[getter]
+    fn get_keep_byte_fallback(self_: PyRef<Self>) -> bool {
+        getter!(self_, CompressionTrainer, keep_byte_fallback)
+    }
+
+    #[setter]
+    fn set_keep_byte_fallback(self_: PyRef<Self>, v: bool) {
+        setter!(self_, CompressionTrainer, keep_byte_fallback, v);
     }
 
     #[getter]
@@ -1016,11 +1076,21 @@ impl PyCompressionTrainer {
         Ok(())
     }
 
+    #[getter]
+    fn get_seed_vocab(self_: PyRef<Self>) -> Option<Vec<String>> {
+        getter!(self_, CompressionTrainer, seed_vocab.clone())
+    }
+
+    #[setter]
+    fn set_seed_vocab(self_: PyRef<Self>, sv: Option<Vec<String>>) {
+        setter!(self_, CompressionTrainer, seed_vocab, sv);
+    }
+
     // ---- Python constructor ----
     #[new]
     #[pyo3(
         signature = (**kwargs),
-        text_signature = "(self, vocab_size=8000, show_progress=True, special_tokens=[], initial_alphabet=[], max_piece_length=16, seed_size=1000000, seed_vocab=None)"
+        text_signature = "(self, vocab_size=8000, show_progress=True, special_tokens=[], initial_alphabet=[], max_piece_length=16, seed_size=1000000, seed_vocab=None, prune_ratio=0.0, min_prune=1, batch_recompute=True, byte_fallback=False, keep_byte_fallback=True)"
     )]
     pub fn new(kwargs: Option<Bound<'_, PyDict>>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::unigram::CompressionTrainer::builder();
@@ -1040,6 +1110,21 @@ impl PyCompressionTrainer {
                     }
                     "seed_size" => {
                         builder.seed_size(val.extract()?);
+                    }
+                    "prune_ratio" => {
+                        builder.prune_ratio(val.extract()?);
+                    }
+                    "min_prune" => {
+                        builder.min_prune(val.extract()?);
+                    }
+                    "batch_recompute" => {
+                        builder.batch_recompute(val.extract()?);
+                    }
+                    "byte_fallback" => {
+                        builder.byte_fallback(val.extract()?);
+                    }
+                    "keep_byte_fallback" => {
+                        builder.keep_byte_fallback(val.extract()?);
                     }
                     "initial_alphabet" => {
                         let alphabet: Vec<String> = val.extract()?;
@@ -1071,7 +1156,7 @@ impl PyCompressionTrainer {
                                 .collect::<PyResult<Vec<_>>>()?,
                         );
                     }
-                    // NEW: allow passing an exact seed vocabulary from Python
+                    // Exact seed vocab from Python
                     "seed_vocab" => {
                         let sv: Option<Vec<String>> = val.extract()?;
                         builder.seed_vocab(sv);

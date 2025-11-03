@@ -431,6 +431,7 @@ impl PyBPE {
     fn set_byte_fallback(self_: PyRef<Self>, byte_fallback: bool) {
         setter!(self_, BPE, byte_fallback, byte_fallback);
     }
+
     #[getter]
     fn get_ignore_merges(self_: PyRef<Self>) -> bool {
         getter!(self_, BPE, ignore_merges)
@@ -440,10 +441,12 @@ impl PyBPE {
     fn set_ignore_merges(self_: PyRef<Self>, ignore_merges: bool) {
         setter!(self_, BPE, ignore_merges, ignore_merges);
     }
+
     #[new]
     #[pyo3(
         signature = (vocab=None, merges=None, **kwargs),
-        text_signature = "(self, vocab=None, merges=None, cache_capacity=None, dropout=None, unk_token=None, continuing_subword_prefix=None, end_of_word_suffix=None, fuse_unk=None, byte_fallback=False, ignore_merges=False)")]
+        text_signature = "(self, vocab=None, merges=None, cache_capacity=None, dropout=None, unk_token=None, continuing_subword_prefix=None, end_of_word_suffix=None, fuse_unk=None, byte_fallback=False, ignore_merges=False)"
+    )]
     fn new(
         py: Python<'_>,
         vocab: Option<PyVocab>,
@@ -465,10 +468,10 @@ impl PyBPE {
                 }
                 (PyVocab::Filename(vocab_filename), PyMerges::Filename(merges_filename)) => {
                     deprecation_warning(
-                    py,
-                    "0.9.0",
-                    "BPE.__init__ will not create from files anymore, try `BPE.from_file` instead",
-                )?;
+                        py,
+                        "0.9.0",
+                        "BPE.__init__ will not create from files anymore, try `BPE.from_file` instead",
+                    )?;
                     builder =
                         builder.files(vocab_filename.to_string(), merges_filename.to_string());
                 }

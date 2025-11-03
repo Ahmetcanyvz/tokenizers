@@ -1,7 +1,7 @@
 //! Greedy compression-based trainer for the Unigram model.
 //!
 //! This trainer minimizes the total number of tokens under **unit-cost decoding**.
-//! It iteratively deletes one token at a time, always picking the token `t` that minimizes
+//! It iteratively deletes token(s) that minimize
 //!
 //!   ΔL(t) = c[t] * ( d[t] - 1 )
 //!
@@ -66,12 +66,33 @@ pub struct CompressionTrainer {
 
     /// Upper bound on seed list size (same default as UnigramTrainer)
     #[builder(default = "1_000_000")]
-    pub seed_size: usize, // <-- public so Python bindings can access/get/set it
+    pub seed_size: usize,
 
     /// If provided, training starts **exactly** from this vocabulary (scores forced to -1.0).
     /// You must include Σ yourself if you want single-char coverage guaranteed.
     #[builder(default)]
     pub seed_vocab: Option<Vec<String>>,
+
+    /// Batch pruning: remove about `ceil(prune_ratio * remaining)` tokens per outer pass
+    /// (but at least `min_prune`, and never more than the remaining tokens needed).
+    /// When `batch_recompute = true`, we recompute Δ after **each** deletion (default, exact);
+    /// otherwise we compute Δ once per pass and delete the top-K (faster, approximate).
+    #[builder(default = "0.0")]
+    pub prune_ratio: f32,
+    #[builder(default = "1")]
+    pub min_prune: usize,
+    #[builder(default = "true")]
+    pub batch_recompute: bool,
+
+    /// If true, enable Unigram byte fallback in the produced model(s).
+    /// Note: the underlying Unigram handles fallback internally; we don't insert explicit byte tokens here.
+    #[builder(default = "false")]
+    pub byte_fallback: bool,
+
+    /// If true, and if fallback tokens are materialized by the underlying implementation,
+    /// they are considered non-deletable. (No-op if the model does not export such tokens.)
+    #[builder(default = "true")]
+    pub keep_byte_fallback: bool,
 
     /// Internal: word/span counts (populated by `feed`)
     #[builder(default = "AHashMap::new()")]
@@ -80,7 +101,9 @@ pub struct CompressionTrainer {
 
 impl Default for CompressionTrainer {
     fn default() -> Self {
-        Self::builder().build().expect("CompressionTrainer::default()")
+        Self::builder()
+            .build()
+            .expect("CompressionTrainer::default()")
     }
 }
 
@@ -295,9 +318,14 @@ impl CompressionTrainer {
     ) -> (usize, Vec<usize>) {
         let tok = &model.vocab[t].0;
         // Forbid `t` itself + all currently disabled tokens
-        let ids = Self::best_path_ids_with_filter(model, tok, |id| id != t && !disabled.contains(&id));
+        let ids =
+            Self::best_path_ids_with_filter(model, tok, |id| id != t && !disabled.contains(&id));
         // With Σ present, ids.len() >= 1; guard against pathological cases anyway.
-        let d = if ids.is_empty() { tok.chars().count().max(1) } else { ids.len() };
+        let d = if ids.is_empty() {
+            tok.chars().count().max(1)
+        } else {
+            ids.len()
+        };
         (d, ids)
     }
 
@@ -328,7 +356,7 @@ impl CompressionTrainer {
                 }
             }
             // No automatic Σ injection here: caller controls it explicitly via seed_vocab.
-            let model = Unigram::from(final_seed, None, false)?;
+            let model = Unigram::from(final_seed, None, self.byte_fallback)?;
             return Ok(model);
         }
 
@@ -351,18 +379,39 @@ impl CompressionTrainer {
         specials.append(&mut pieces);
 
         // Convert every score to -1.0 so maximizing total score gives **minimal number of tokens**
-        let final_seed: Vec<(String, f64)> = specials
-            .into_iter()
-            .map(|(s, _)| (s, -1.0))
-            .collect();
+        let final_seed: Vec<(String, f64)> =
+            specials.into_iter().map(|(s, _)| (s, -1.0)).collect();
 
-        // No UNK during training; byte_fallback off.
-        let model = Unigram::from(final_seed, /*unk_id*/ None, /*byte_fallback*/ false)?;
+        // No UNK during training; byte_fallback as requested.
+        let model = Unigram::from(final_seed, /*unk_id*/ None, /*byte_fallback*/ self.byte_fallback)?;
         Ok(model)
     }
 
+    #[inline]
+    fn batch_size_for(&self, remaining: usize) -> usize {
+        if remaining == 0 {
+            return 0;
+        }
+        let mut k = if self.prune_ratio > 0.0 {
+            ((remaining as f32) * self.prune_ratio).ceil() as usize
+        } else {
+            1
+        };
+        if k < self.min_prune {
+            k = self.min_prune;
+        }
+        if k > remaining {
+            k = remaining;
+        }
+        k
+    }
+
     /// Main training logic; separated to keep `train` small.
-    pub fn do_train(&self, sentences: Vec<Sentence>, model: &mut Unigram) -> Result<Vec<AddedToken>> {
+    pub fn do_train(
+        &self,
+        sentences: Vec<Sentence>,
+        model: &mut Unigram,
+    ) -> Result<Vec<AddedToken>> {
         let progress = self.setup_progress();
 
         // 1) Prepare Σ and initial model
@@ -370,26 +419,45 @@ impl CompressionTrainer {
         let m = self.build_initial_model(&sentences, &required)?;
 
         // Define non-deletable strings (Σ + special tokens)
-        let non_deletable_strings: AHashSet<String> = required
+        let mut non_deletable_strings: AHashSet<String> = required
             .iter()
             .cloned()
             .chain(self.special_tokens.iter().map(|t| t.content.clone()))
             .collect();
 
-        // Identify ids belonging to Σ/specials
-        let is_non_deletable = |id: usize, m: &Unigram| -> bool { non_deletable_strings.contains(&m.vocab[id].0) };
+        // If byte fallback is enabled and the implementation exposes any materialized
+        // fallback strings in the initial vocab, we keep them (best-effort).
+        // (No-op if none are present.)
+        if self.byte_fallback && self.keep_byte_fallback {
+            for (s, _) in &m.vocab {
+                // Heuristic: fallback strings often aren't plain alphabetic (implementation-defined).
+                // We conservatively keep tokens that contain non-alphanumeric ASCII.
+                if s.chars()
+                    .any(|c| !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
+                {
+                    non_deletable_strings.insert(s.clone());
+                }
+            }
+        }
+
+        // Identify ids belonging to Σ/specials/kept
+        let is_non_deletable = |id: usize, m: &Unigram| -> bool {
+            non_deletable_strings.contains(&m.vocab[id].0)
+        };
 
         // 2) Initial segmentation of the entire corpus (unit-cost via -1.0 per token)
         let n = sentences.len();
         self.update_progress(&progress, n, "Initial segmentation");
         let mut seg_tokens: Vec<Vec<usize>> = Vec::with_capacity(n); // per-sentence best path ids
-        let mut seg_len: Vec<usize> = Vec::with_capacity(n);         // per-sentence path lengths
+        let mut seg_len: Vec<usize> = Vec::with_capacity(n); // per-sentence path lengths
         // Global counts c[t] and inverted index D[t]
         let mut ct: Vec<u32> = vec![0; m.len()];
         let mut Dt: Vec<AHashSet<usize>> = vec![AHashSet::new(); m.len()];
 
         for (i, (s, cnt)) in sentences.iter().enumerate() {
-            if let Some(p) = &progress { p.inc(1); }
+            if let Some(p) = &progress {
+                p.inc(1);
+            }
 
             // Populate lattice and run Viterbi with *all* tokens enabled
             let mut lattice = Lattice::from(s, m.bos_id, m.eos_id);
@@ -408,13 +476,15 @@ impl CompressionTrainer {
 
         // 3) Precompute d[t] and Dep[t] (dependencies), and build reverse dependency R[u]
         self.update_progress(&progress, m.len(), "Precompute d[t] & deps");
-        let mut disabled: AHashSet<usize> = AHashSet::new();          // removed token ids
-        let mut dt: Vec<usize> = vec![1; m.len()];                    // shortest decomposition length per token
-        let mut deps: Vec<Vec<usize>> = vec![Vec::new(); m.len()];    // decomposition ids per token
-        let mut R: Vec<AHashSet<usize>> = vec![AHashSet::new(); m.len()]; // reverse deps: u -> { t | u ∈ deps[t] }
+        let mut disabled: AHashSet<usize> = AHashSet::new(); // removed token ids
+        let mut dt: Vec<usize> = vec![1; m.len()]; // shortest decomposition length per token
+        let mut deps: Vec<Vec<usize>> = vec![Vec::new(); m.len()]; // decomposition ids per token
+        let mut rdeps: Vec<AHashSet<usize>> = vec![AHashSet::new(); m.len()]; // reverse deps: u -> { t | u ∈ deps[t] }
 
         for t in 0..m.len() {
-            if let Some(p) = &progress { p.inc(1); }
+            if let Some(p) = &progress {
+                p.inc(1);
+            }
             if is_non_deletable(t, &m) {
                 dt[t] = 1;
                 deps[t].clear();
@@ -424,110 +494,211 @@ impl CompressionTrainer {
             dt[t] = d;
             deps[t] = used.clone();
             for &u in &used {
-                R[u].insert(t);
+                rdeps[u].insert(t);
             }
         }
         self.finalize_progress(&progress, m.len());
 
-        // 4) Iterative greedy deletion until we hit the target vocabulary size
-        // We don't physically remove tokens; we mark them disabled and filter during DP.
+        // 4) Iterative greedy deletion with optional batch size
         let mut enabled_count = m.len();
         let target = self.vocab_size as usize;
+
         if enabled_count <= target {
             // Nothing to delete; just return the current model
             *model = m.clone();
             return Ok(self.special_tokens.clone());
         }
 
-        // Allow showing iteration count
-        self.update_progress(&progress, enabled_count - target, "Greedy deletions");
+        let mut remaining = enabled_count - target;
+        self.update_progress(&progress, remaining, "Greedy deletions");
 
-        'outer: for _iter in 0..(enabled_count - target) {
-            if let Some(p) = &progress { p.inc(1); }
+        while remaining > 0 {
+            let k_pass = self.batch_size_for(remaining);
+            if k_pass == 0 {
+                break;
+            }
 
-            // 4.1) Pick the best token to delete: minimize ΔL(t) = c[t] * (d[t] - 1)
-            let mut best_t: Option<usize> = None;
-            let mut best_delta: u64 = u64::MAX;
+            if self.batch_recompute {
+                // Exact: delete one, re-segment, recompute, repeat k_pass times
+                for _ in 0..k_pass {
+                    // Pick the best token to delete: minimize ΔL(t) = c[t] * (d[t] - 1)
+                    let mut best_t: Option<usize> = None;
+                    let mut best_delta: u64 = u64::MAX;
 
-            for t in 0..m.len() {
-                if disabled.contains(&t) {
-                    continue;
+                    for t in 0..m.len() {
+                        if disabled.contains(&t) {
+                            continue;
+                        }
+                        if is_non_deletable(t, &m) {
+                            continue; // never delete Σ/specials/kept
+                        }
+                        let c_t = ct[t] as u64;
+                        if c_t == 0 {
+                            // Deleting an unused token is safe and Δ=0: immediately pick it.
+                            best_t = Some(t);
+                            best_delta = 0;
+                            break;
+                        }
+                        let d_t = dt[t] as u64;
+                        let delta = c_t.saturating_mul(d_t.saturating_sub(1));
+                        if delta < best_delta {
+                            best_delta = delta;
+                            best_t = Some(t);
+                        }
+                    }
+
+                    let Some(t_star) = best_t else {
+                        // No deletable token remains
+                        remaining = 0;
+                        break;
+                    };
+
+                    // Disable t*
+                    disabled.insert(t_star);
+                    enabled_count -= 1;
+                    remaining -= 1;
+                    if let Some(p) = &progress {
+                        p.inc(1);
+                    }
+
+                    // Resegment only sentences that used t*
+                    let affected: Vec<usize> = Dt[t_star].iter().copied().collect();
+                    for &s_idx in &affected {
+                        // Fetch sentence text & count without moving them
+                        let s: &str = &sentences[s_idx].0;
+                        let cnt: u32 = sentences[s_idx].1;
+
+                        // Remove old counts for this sentence
+                        for &old_id in &seg_tokens[s_idx] {
+                            ct[old_id] = ct[old_id].saturating_sub(cnt);
+                        }
+                        // Remove sentence from all old D[·]
+                        for &old_id in &seg_tokens[s_idx] {
+                            Dt[old_id].remove(&s_idx);
+                        }
+
+                        // Recompute best path with filtered tokens (exclude disabled set)
+                        let new_ids =
+                            Self::best_path_ids_with_filter(&m, s, |id| !disabled.contains(&id));
+
+                        // Update per-sentence path and length
+                        seg_len[s_idx] = new_ids.len();
+                        seg_tokens[s_idx] = new_ids.clone();
+
+                        // Add new counts and update inverted index
+                        for &id in &new_ids {
+                            ct[id] = ct[id].saturating_add(cnt);
+                            Dt[id].insert(s_idx);
+                        }
+                    }
+                    // Clear D[t*] after processing its sentences
+                    Dt[t_star].clear();
+
+                    // Recompute d[·] only for tokens whose decomposition used t*
+                    let impacted: Vec<usize> = rdeps[t_star].iter().copied().collect();
+                    for t in impacted {
+                        // Remove old reverse links: t depended on deps[t]
+                        for &u in &deps[t] {
+                            rdeps[u].remove(&t);
+                        }
+                        // Recompute d[t] and deps[t] under the new disabled set
+                        let (d, used) = Self::compute_dt_with_deps(&m, t, &disabled);
+                        dt[t] = d;
+                        deps[t] = used.clone();
+                        // Add new reverse links
+                        for &u in &used {
+                            rdeps[u].insert(t);
+                        }
+                    }
+
+                    if remaining == 0 {
+                        break;
+                    }
                 }
-                if is_non_deletable(t, &m) {
-                    continue; // never delete Σ or specials
+            } else {
+                // Approximate, faster: compute candidates once, remove top-K based on stale Δ
+                let mut candidates: Vec<(u64, usize)> = Vec::new();
+                for t in 0..m.len() {
+                    if disabled.contains(&t) || is_non_deletable(t, &m) {
+                        continue;
+                    }
+                    let c_t = ct[t] as u64;
+                    let d_t = dt[t] as u64;
+                    let delta = c_t.saturating_mul(d_t.saturating_sub(1));
+                    candidates.push((delta, t));
                 }
-                let c_t = ct[t] as u64;
-                if c_t == 0 {
-                    // Deleting an unused token is always safe and Δ=0
-                    best_t = Some(t);
+                if candidates.is_empty() {
                     break;
                 }
-                let d_t = dt[t] as u64;
-                let delta = c_t.saturating_mul(d_t.saturating_sub(1));
-                if delta < best_delta {
-                    best_delta = delta;
-                    best_t = Some(t);
+                candidates.sort_by_key(|&(delta, _)| delta);
+
+                let mut removed_in_pass = 0usize;
+                for &(_delta, t_star) in candidates.iter().take(k_pass) {
+                    if disabled.contains(&t_star) {
+                        continue;
+                    }
+                    if is_non_deletable(t_star, &m) {
+                        continue;
+                    }
+                    // Disable t*
+                    disabled.insert(t_star);
+                    enabled_count -= 1;
+                    remaining -= 1;
+                    removed_in_pass += 1;
+                    if let Some(p) = &progress {
+                        p.inc(1);
+                    }
+
+                    // Resegment only sentences that used t*
+                    let affected: Vec<usize> = Dt[t_star].iter().copied().collect();
+                    for &s_idx in &affected {
+                        let s: &str = &sentences[s_idx].0;
+                        let cnt: u32 = sentences[s_idx].1;
+
+                        for &old_id in &seg_tokens[s_idx] {
+                            ct[old_id] = ct[old_id].saturating_sub(cnt);
+                        }
+                        for &old_id in &seg_tokens[s_idx] {
+                            Dt[old_id].remove(&s_idx);
+                        }
+
+                        let new_ids =
+                            Self::best_path_ids_with_filter(&m, s, |id| !disabled.contains(&id));
+
+                        seg_len[s_idx] = new_ids.len();
+                        seg_tokens[s_idx] = new_ids.clone();
+
+                        for &id in &new_ids {
+                            ct[id] = ct[id].saturating_add(cnt);
+                            Dt[id].insert(s_idx);
+                        }
+                    }
+                    Dt[t_star].clear();
+
+                    // Update d[·] only for tokens whose decomposition used t*
+                    let impacted: Vec<usize> = rdeps[t_star].iter().copied().collect();
+                    for t in impacted {
+                        for &u in &deps[t] {
+                            rdeps[u].remove(&t);
+                        }
+                        let (d, used) = Self::compute_dt_with_deps(&m, t, &disabled);
+                        dt[t] = d;
+                        deps[t] = used.clone();
+                        for &u in &used {
+                            rdeps[u].insert(t);
+                        }
+                    }
+
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                if removed_in_pass == 0 {
+                    // No progress: stop to avoid infinite loop
+                    break;
                 }
             }
-
-            let Some(t_star) = best_t else {
-                // No deletable token remains
-                break 'outer;
-            };
-
-            // 4.2) Disable t*
-            disabled.insert(t_star);
-            enabled_count -= 1;
-
-            // 4.3) Resegment only sentences that used t*
-            let affected: Vec<usize> = Dt[t_star].iter().copied().collect();
-            for &s_idx in &affected {
-                // Fetch sentence text & count without moving them
-                let s: &str = &sentences[s_idx].0;
-                let cnt: u32 = sentences[s_idx].1;
-
-                // Remove old counts for this sentence
-                for &old_id in &seg_tokens[s_idx] {
-                    ct[old_id] = ct[old_id].saturating_sub(cnt);
-                }
-                // Remove sentence from all old D[·]
-                for &old_id in &seg_tokens[s_idx] {
-                    Dt[old_id].remove(&s_idx);
-                }
-
-                // Recompute best path with filtered tokens (exclude disabled set)
-                let new_ids = Self::best_path_ids_with_filter(&m, s, |id| !disabled.contains(&id));
-
-                // Update per-sentence path and length
-                seg_len[s_idx] = new_ids.len();
-                seg_tokens[s_idx] = new_ids.clone();
-
-                // Add new counts and update inverted index
-                for &id in &new_ids {
-                    ct[id] = ct[id].saturating_add(cnt);
-                    Dt[id].insert(s_idx);
-                }
-            }
-            // Clear D[t*] after processing its sentences
-            Dt[t_star].clear();
-
-            // 4.4) Recompute d[·] only for tokens whose decomposition used t*
-            let impacted: Vec<usize> = R[t_star].iter().copied().collect();
-            for t in impacted {
-                // Remove old reverse links: t depended on deps[t]
-                for &u in &deps[t] {
-                    R[u].remove(&t);
-                }
-                // Recompute d[t] and deps[t] under the new disabled set
-                let (d, used) = Self::compute_dt_with_deps(&m, t, &disabled);
-                dt[t] = d;
-                deps[t] = used.clone();
-                // Add new reverse links
-                for &u in &used {
-                    R[u].insert(t);
-                }
-            }
-            // No need to touch R[t*] further; t* won't be used again.
         }
 
         self.finalize_progress(&progress, enabled_count.saturating_sub(target));
@@ -541,7 +712,11 @@ impl CompressionTrainer {
             .map(|(_, p)| (p.0.clone(), -1.0)) // keep unit-cost via constant -1.0 scores
             .collect();
 
-        let final_model = Unigram::from(final_pieces, /*unk_id*/ None, /*byte_fallback*/ false)?;
+        let final_model = Unigram::from(
+            final_pieces,
+            /*unk_id*/ None,
+            /*byte_fallback*/ self.byte_fallback,
+        )?;
         *model = final_model;
 
         Ok(self.special_tokens.clone())

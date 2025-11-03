@@ -60,6 +60,7 @@ class BpeTrainer(Trainer):
     ):
         pass
 
+
 class UnigramTrainer(Trainer):
     """
     Trainer capable of training a Unigram model
@@ -93,6 +94,10 @@ class UnigramTrainer(Trainer):
         n_sub_iterations (:obj:`int`):
             The number of iterations of the EM algorithm to perform before
             pruning the vocabulary.
+
+        seed_size (:obj:`int`, `optional`):
+            Upper bound on the number of seed candidates considered when initializing
+            Unigram (mirrors the Rust builder).
     """
     def __init__(
         self,
@@ -104,8 +109,10 @@ class UnigramTrainer(Trainer):
         unk_token=None,
         max_piece_length=16,
         n_sub_iterations=2,
+        seed_size=None,
     ):
         pass
+
 
 class WordLevelTrainer(Trainer):
     """
@@ -126,6 +133,7 @@ class WordLevelTrainer(Trainer):
     """
     def __init__(self, vocab_size=30000, min_frequency=0, show_progress=True, special_tokens=[]):
         pass
+
 
 class WordPieceTrainer(Trainer):
     """
@@ -169,5 +177,56 @@ class WordPieceTrainer(Trainer):
         initial_alphabet=[],
         continuing_subword_prefix="##",
         end_of_word_suffix=None,
+    ):
+        pass
+
+
+class CompressionTrainer(Trainer):
+    """
+    Greedy compression-based trainer for the Unigram model.
+
+    This trainer minimizes the total number of tokens under **unit-cost decoding**
+    by iteratively deleting the token `t` that minimizes:
+
+        ΔL(t) = c[t] * ( d[t] - 1 )
+
+    where `c[t]` is the corpus count of `t` in the best (unit-cost) segmentations,
+    and `d[t]` is the shortest decomposition length of the string of `t`
+    using `V \\ {t}`. After deleting a token, only the sentences that used it
+    are re-segmented, and only the impacted decomposition lengths are recomputed.
+
+    Args:
+        vocab_size (:obj:`int`):
+            Target final vocabulary size (includes special tokens).
+
+        show_progress (:obj:`bool`, `optional`):
+            Whether to show progress bars while training.
+
+        special_tokens (:obj:`List[Union[str, AddedToken]]`, `optional`):
+            Special tokens to prepend in the vocabulary (kept; never deleted).
+
+        initial_alphabet (:obj:`List[str]`, `optional`):
+            Characters to force-include in Σ even if not present in the data.
+            If a string has more than one character, only the first one is kept.
+
+        max_piece_length (:obj:`int`, `optional`):
+            Maximum token length considered when seeding substrings.
+
+        seed_size (:obj:`int`, `optional`):
+            Upper bound on the number of seed candidates (same default as UnigramTrainer).
+
+        seed_vocab (:obj:`List[str]`, `optional`):
+            If provided, training starts **exactly** from this vocabulary (scores forced to -1.0).
+            You must include single-character tokens yourself if you want full Σ coverage.
+    """
+    def __init__(
+        self,
+        vocab_size=8000,
+        show_progress=True,
+        special_tokens=[],
+        initial_alphabet=[],
+        max_piece_length=16,
+        seed_size=1000000,
+        seed_vocab=None,
     ):
         pass
