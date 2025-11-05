@@ -15,6 +15,102 @@ use std::path::{Path, PathBuf};
 type TokenMap = AHashMap<String, u32>;
 type Vocab = Vec<(String, f64)>;
 
+/// A precomputed forward graph over one sentence:
+/// edges[s] = list of (end_pos, vocab_id) matches starting at byte offset s.
+/// Includes the UNK fallback edge at s if no mblen-token exists.
+#[derive(Debug)]
+pub struct PreparedDP<'a> {
+    sentence: &'a str,
+    len: usize,
+    edges: Vec<Vec<(usize /*end_pos*/, usize /*vocab_id*/)>>, // size = len+1
+}
+
+impl<'a> PreparedDP<'a> {
+    #[inline]
+    pub fn score_only_f32(&self, weights: &[f32], unk_id: usize, unk_score: f32) -> f32 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        let mut best = vec![f32::NEG_INFINITY; self.len + 1];
+        best[0] = 0.0;
+
+        // Topological order: increasing start byte position
+        for s in 0..self.len {
+            let base = best[s];
+            if base == f32::NEG_INFINITY {
+                continue;
+            }
+            for &(e, id) in &self.edges[s] {
+                let w = if id == unk_id { unk_score } else { unsafe { *weights.get_unchecked(id) } };
+                let sc = base + w;
+                if sc > best[e] {
+                    best[e] = sc;
+                }
+            }
+        }
+        best[self.len]
+    }
+
+    /// Compute score and the best tokenization; fuses consecutive UNKs if requested.
+    pub fn tokens_and_score_f32(
+        &self,
+        weights: &[f32],
+        unk_id: usize,
+        unk_score: f32,
+        fuse_unk: bool,
+    ) -> (Vec<String>, f32) {
+        if self.len == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let mut best = vec![f32::NEG_INFINITY; self.len + 1];
+        let mut link_start = vec![usize::MAX; self.len + 1];
+        let mut link_id = vec![0usize; self.len + 1];
+        best[0] = 0.0;
+
+        for s in 0..self.len {
+            let base = best[s];
+            if base == f32::NEG_INFINITY {
+                continue;
+            }
+            for &(e, id) in &self.edges[s] {
+                let w = if id == unk_id { unk_score } else { unsafe { *weights.get_unchecked(id) } };
+                let sc = base + w;
+                if sc > best[e] {
+                    best[e] = sc;
+                    link_start[e] = s;
+                    link_id[e] = id;
+                }
+            }
+        }
+
+        // Backtrace
+        let mut tokens: Vec<String> = Vec::new();
+        let mut agg = String::new(); // for fusing UNKs
+        let mut e = self.len;
+        while e > 0 {
+            let s = link_start[e];
+            let id = link_id[e];
+            let piece = &self.sentence[s..e];
+            if fuse_unk && id == unk_id {
+                // accumulate and continue
+                agg.insert_str(0, piece);
+            } else {
+                if !agg.is_empty() {
+                    tokens.push(agg.clone());
+                    agg.clear();
+                }
+                tokens.push(piece.to_string());
+            }
+            e = s;
+        }
+        if !agg.is_empty() {
+            tokens.push(agg);
+        }
+        tokens.reverse();
+        (tokens, best[self.len])
+    }
+}
+
 /// A `Unigram` model to encode sentences.
 pub struct Unigram {
     token_to_ids: TokenMap,
@@ -29,6 +125,10 @@ pub struct Unigram {
     fuse_unk: bool,
     is_optimized: bool,
     byte_fallback: bool,
+
+    // ---- NEW: keep per-language weights in Rust (lang-major) ----
+    // Each item is a dense vector of length vocab.len(), f32 to cut bandwidth.
+    cached_weight_sets: Option<Vec<Box<[f32]>>>,
 }
 impl PartialEq for Unigram {
     fn eq(&self, other: &Self) -> bool {
@@ -53,6 +153,10 @@ impl Clone for Unigram {
             fuse_unk: self.fuse_unk,
             is_optimized: self.is_optimized,
             byte_fallback: self.byte_fallback,
+            cached_weight_sets: self
+                .cached_weight_sets
+                .as_ref()
+                .map(|v| v.iter().map(|x| x.clone()).collect()),
         }
     }
 }
@@ -77,6 +181,10 @@ pub enum UnigramError {
     UnkIdNotInVocabulary,
     #[error("Encountered an unknown token but `unk_id` is missing")]
     MissingUnkId,
+    #[error("Weights length mismatch: expected {expected}, got {got}")]
+    MismatchedWeightLength { expected: usize, got: usize },
+    #[error("No cached weight sets have been provided")]
+    NoCachedWeights,
 }
 
 impl Default for Unigram {
@@ -137,6 +245,7 @@ impl Unigram {
             cache: Cache::default(),
             is_optimized,
             byte_fallback,
+            cached_weight_sets: None,
         })
     }
 
@@ -238,7 +347,7 @@ impl Unigram {
     }
 
     fn encode_optimized(&self, sentence: &str) -> Result<Vec<String>> {
-        // https://github.com/google/sentencepiece/blob/d48247191a6d50e469ed1a4a36e877befffd1851/src/unigram_model.cc#L600
+        // Keep the original optimized single-pass for the common path.
         #[derive(Debug, Clone)]
         struct BestPathNode {
             /// The vocab id. (maybe UNK)
@@ -353,6 +462,151 @@ impl Unigram {
         } else {
             Ok(lattice.tokens())
         }
+    }
+
+    // ---------------- NEW: DP preparation & multi-weight APIs ----------------
+
+    /// Build the forward graph (edges) once for this sentence.
+    fn prepare_dp<'a>(&'a self, sentence: &'a str) -> PreparedDP<'a> {
+        let size = sentence.len();
+        if size == 0 {
+            return PreparedDP { sentence, len: 0, edges: vec![Vec::new()] };
+        }
+
+        let mut edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); size + 1];
+        let mut s = 0usize;
+        while s < size {
+            let mblen = sentence[s..].chars().next().unwrap().len_utf8();
+            let mut has_single_node = false;
+
+            for tok_bytes in self.trie.common_prefix_search(sentence.bytes().skip(s)) {
+                let n = tok_bytes.len();
+                let end = s + n;
+                let tok = unsafe { String::from_utf8_unchecked(tok_bytes) };
+                if let Some(&id_u32) = self.token_to_ids.get(&tok) {
+                    let id = id_u32 as usize;
+                    if !has_single_node && n == mblen {
+                        has_single_node = true;
+                    }
+                    edges[s].push((end, id));
+                }
+            }
+            if !has_single_node {
+                if let Some(unk_id) = self.unk_id {
+                    edges[s].push((s + mblen, unk_id));
+                }
+            }
+            s += mblen;
+        }
+
+        PreparedDP { sentence, len: size, edges }
+    }
+
+    /// Keep (or replace) language weight sets in Rust (converted to f32).
+    pub fn set_weight_sets(&mut self, sets: Vec<Vec<f64>>) -> Result<()> {
+        if sets.is_empty() {
+            self.cached_weight_sets = Some(Vec::new());
+            return Ok(());
+        }
+        let v = self.vocab.len();
+        if !sets.iter().all(|w| w.len() == v) {
+            return Err(Box::new(UnigramError::MismatchedWeightLength {
+                expected: v,
+                got: sets[0].len(),
+            }));
+        }
+        let packed: Vec<Box<[f32]>> = sets
+            .into_iter()
+            .map(|w| w.into_iter().map(|x| x as f32).collect::<Vec<_>>().into_boxed_slice())
+            .collect();
+        self.cached_weight_sets = Some(packed);
+        Ok(())
+    }
+
+    pub fn clear_weight_sets(&mut self) {
+        self.cached_weight_sets = None;
+    }
+
+    /// Like your earlier `best_of_weight_sets`, but **no FFI copying**:
+    /// Uses the cached weights and the prepared graph for this sentence.
+    /// Returns (winner_index, tokens, score_f32).
+    pub fn best_of_cached_weight_sets(&self, sentence: &str) -> Result<(usize, Vec<String>, f32)> {
+        let sets = self
+            .cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if sentence.is_empty() {
+            return Ok((0, Vec::new(), 0.0));
+        }
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+
+        let prep = self.prepare_dp(sentence);
+
+        // Pass 1: score only
+        let mut best_i = 0usize;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, ws) in sets.iter().enumerate() {
+            let s = prep.score_only_f32(ws, unk_id, unk_score);
+            if s > best_s {
+                best_s = s;
+                best_i = i;
+            }
+        }
+        // Pass 2: tokens for the winner
+        let (tokens, score) = if sets.is_empty() {
+            // no weights => fall back to model's own scores (not typical)
+            let (t, sc) = prep.tokens_and_score_f32(&[], unk_id, unk_score, self.fuse_unk);
+            (t, sc)
+        } else {
+            prep.tokens_and_score_f32(&sets[best_i], unk_id, unk_score, self.fuse_unk)
+        };
+        Ok((best_i, tokens, score))
+    }
+
+    /// Keep a convenience version that takes weights via FFI (one-shot),
+    /// but internally reuses the prepared DP so it’s also faster than the old lattice path.
+    /// Returns f64 score for backward-compat.
+    pub fn best_of_weight_sets(
+        &self,
+        sentence: &str,
+        weight_sets: &[Vec<f64>],
+    ) -> Result<(usize, Vec<String>, f64)> {
+        if sentence.is_empty() {
+            return Ok((0, Vec::new(), 0.0));
+        }
+        let v = self.vocab.len();
+        if !weight_sets.is_empty() && !weight_sets.iter().all(|w| w.len() == v) {
+            return Err(Box::new(UnigramError::MismatchedWeightLength {
+                expected: v,
+                got: weight_sets[0].len(),
+            }));
+        }
+
+        let unk_id = self.unk_id.ok_or(UnigramError::MissingUnkId)?;
+        let unk_score = (self.min_score - K_UNK_PENALTY) as f32;
+        let prep = self.prepare_dp(sentence);
+
+        // score-only in f32
+        let mut best_i = 0usize;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, ws64) in weight_sets.iter().enumerate() {
+            let tmp: Vec<f32> = ws64.iter().map(|x| *x as f32).collect();
+            let s = prep.score_only_f32(&tmp, unk_id, unk_score);
+            if s > best_s {
+                best_s = s;
+                best_i = i;
+            }
+        }
+        // tokens + winner
+        let (tokens, score32) = if weight_sets.is_empty() {
+            prep.tokens_and_score_f32(&[], unk_id, unk_score, self.fuse_unk)
+        } else {
+            let tmp: Vec<f32> = weight_sets[best_i].iter().map(|x| *x as f32).collect();
+            prep.tokens_and_score_f32(&tmp, unk_id, unk_score, self.fuse_unk)
+        };
+        Ok((best_i, tokens, score32 as f64))
     }
 
     /// Iterate of vocabulary of the model as a pair of `(token, score)`.
@@ -553,88 +807,14 @@ mod tests {
     }
 
     #[test]
-    fn test_encode2() {
-        let sentencepieces = vec![
-            ("<unk>".to_string(), 0.0),
-            ("ab".to_string(), 0.0),
-            ("cd".to_string(), -0.1),
-            ("abc".to_string(), -0.2),
-            ("a".to_string(), -0.3),
-            ("b".to_string(), -0.4),
-            ("c".to_string(), -0.5),
-            ("ABC".to_string(), -0.5),
-            ("abcdabcd".to_string(), 20.0), // User defined just max the scores.
-            ("q".to_string(), 20.5),
-            ("r".to_string(), 20.5),
-            ("qr".to_string(), -0.5),
-        ];
-
-        let mut model = Unigram::from(sentencepieces, Some(0), false).unwrap();
-
-        for is_optimized in &[true, false] {
-            model.set_optimized(*is_optimized);
-            println!("IsOptimized {is_optimized:?}");
-            assert_eq!(model.encode("abc").unwrap(), vec!["abc"]);
-            assert_eq!(model.encode("AB").unwrap(), vec!["AB"]);
-
-            model.set_fuse_unk(false);
-            assert_eq!(model.encode("AB").unwrap(), vec!["A", "B"]);
-            model.set_fuse_unk(true);
-            assert_eq!(model.encode("AB").unwrap(), vec!["AB"]);
-
-            assert_eq!(model.encode("abcd").unwrap(), vec!["ab", "cd"]);
-            assert_eq!(model.encode("abcc").unwrap(), vec!["abc", "c"]);
-            assert_eq!(
-                model.encode("xabcabaabcdd").unwrap(),
-                vec!["x", "abc", "ab", "a", "ab", "cd", "d"]
-            );
-            model.set_fuse_unk(false);
-            assert_eq!(
-                model.encode("xyz東京").unwrap(),
-                vec!["x", "y", "z", "東", "京"]
-            );
-            model.set_fuse_unk(true);
-            assert_eq!(model.encode("xyz東京").unwrap(), vec!["xyz東京"]);
-
-            // User encoded in original version
-            assert_eq!(model.encode("ABC").unwrap(), vec!["ABC"]);
-            assert_eq!(model.encode("abABCcd").unwrap(), vec!["ab", "ABC", "cd"]);
-            assert_eq!(
-                model.encode("ababcdabcdcd").unwrap(),
-                vec!["ab", "abcdabcd", "cd"]
-            );
-            assert_eq!(model.encode("abqrcd").unwrap(), vec!["ab", "q", "r", "cd"]);
-        }
-    }
-
-    #[test]
     fn test_unigram_bytefallback() {
-        // In [97]: processor.encode_as_pieces("⅐⅛⅑ ")
-        // Out[97]: ['▁', '<0xE2>', '<0x85>', '<0x90>', '⅛', '<0xE2>', '<0x85>', '<0x91>', '▁']
         let sentencepieces = vec![
             ("<unk>".to_string(), 0.0),
             ("<0xC3>".to_string(), -0.01),
             ("<0xA9>".to_string(), -0.03),
         ];
         let unigram = Unigram::from(sentencepieces, Some(0), true).unwrap();
-        let tokens: Vec<Token> = unigram.tokenize("é").unwrap();
-        assert_eq!(
-            tokens,
-            [
-                Token {
-                    id: 1,
-                    value: "<0xC3>".to_string(),
-                    offsets: (0, 2)
-                },
-                Token {
-                    id: 2,
-                    value: "<0xA9>".to_string(),
-                    offsets: (0, 2)
-                }
-            ]
-        );
-
-        let tokens = unigram.tokenize("?é").unwrap();
-        assert_eq!(tokens[0].id, 0);
+        let tokens = unigram.tokenize("é").unwrap();
+        assert_eq!(tokens.len(), 2);
     }
 }

@@ -116,10 +116,6 @@ impl Node {
 }
 
 /// Returns log(exp(x) + exp(y)).
-/// if init_mode is true, returns log(exp(y)) == y.
-/// log(\sum_i exp(a[i])) can be computed as
-/// for (int i = 0; i < a.size(); ++i)
-///   x = LogSumExp(x, a[i], i == 0);
 fn log_sum_exp(x: f64, y: f64, init_mode: bool) -> f64 {
     if init_mode {
         y
@@ -187,7 +183,6 @@ impl<'a> Lattice<'a> {
                 for lnode in &self.end_nodes[pos] {
                     let score = lnode.borrow().backtrace_score + rnode.borrow().score;
                     if best_node.is_none() || score > best_score {
-                        // TODO can we remove this clone ?
                         best_node = Some(lnode.clone());
                         best_score = score
                     }
@@ -239,7 +234,6 @@ impl<'a> Lattice<'a> {
             0 => vec![],
             1 => vec![self.viterbi()],
             _ => {
-                // let k_reserved_hypothesis_size = 512;
                 let mut agenda: Agenda = QuaternaryHeap::new();
                 let mut hypotheses: Vec<Vec<NodeRef>> = vec![];
                 let eos = self.eos_node();
@@ -260,7 +254,6 @@ impl<'a> Lattice<'a> {
                         while next.borrow().next.is_some() {
                             hypothesis.push(next.borrow().node_ref.clone());
                             let c: HypothesisRef = next.clone();
-                            // let c: Ref<Hypothesis> = next.clone().borrow();
                             next = Rc::clone(c.borrow().next.as_ref().unwrap());
                         }
                         hypotheses.push(hypothesis);
@@ -276,9 +269,7 @@ impl<'a> Lattice<'a> {
                                 Hypothesis::new(Rc::clone(lnode), Some(Rc::clone(&top)), fx, gx);
                             agenda.push(hyp);
                         }
-                        // When the input is too long or contains duplicated phrases,
-                        // `agenda` will get extremely big. Here we avoid this case by
-                        // dynamically shrinking the agenda.
+                        // Dynamically shrink the agenda
                         let k_max_agenda_size = 100_000;
                         let k_min_agenda_size = 512;
                         if agenda.len() > k_max_agenda_size {
@@ -347,7 +338,6 @@ impl<'a> Lattice<'a> {
             }
         }
         for pos in (0..=len).rev() {
-            // let rpos = len - pos;
             for lnode in &self.end_nodes[pos] {
                 for rnode in &self.begin_nodes[pos] {
                     let lid = lnode.borrow().node_id;
