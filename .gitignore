@@ -24,3 +24,8 @@ pip-wheel-metadata
 
 .vscode
 *.code-workspace
+/fineweb_data/*
+/results_10k/*
+/results_100k/*
+/results_50k/*
+/old_toks/*

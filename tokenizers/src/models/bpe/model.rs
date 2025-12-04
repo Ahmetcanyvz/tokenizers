@@ -3,6 +3,7 @@ use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, DEFAULT_CACHE_CAPACITY, MAX_LENGTH};
 use crate::utils::iter::ResultShunt;
 use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -18,6 +19,53 @@ pub type Vocab = AHashMap<String, u32>;
 type VocabR = AHashMap<u32, String>;
 pub type MergeMap = AHashMap<Pair, (u32, u32)>;
 pub type Merges = Vec<(String, String)>;
+
+/* ----------------------------- TELEMETRY TYPES ---------------------------- */
+
+/// One accepted merge step (for telemetry/analysis).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MergeEvent {
+    /// 0-based step index (order of acceptance)
+    pub step: u32,
+    /// Pair merged (IDs of lhs, rhs)
+    pub pair: Pair,
+    /// ID of the new symbol created by this merge
+    pub new_id: u32,
+    /// Current pair count at selection time
+    pub count: u64,
+    /// Selection score used by the policy (count / ΔLL_exact / ΔLL_approx)
+    pub score: f64,
+    /// Optional exact ΔLL change if tracked (None when not tracking)
+    pub delta_ll: Option<f64>,
+}
+
+/// An item inside a snapshot of the selection scores.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScoreItem {
+    pub pair: Pair,
+    pub score: f64,
+    pub count: u64,
+}
+
+/// A snapshot of the score queue (e.g., top-K) taken every N merges.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScoreSnapshot {
+    pub step: u32,
+    pub items: Vec<ScoreItem>,
+}
+
+/// Container for all telemetry recorded during training.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BpeTelemetry {
+    /// Exact total log-likelihood after each accepted merge (when enabled)
+    pub ll: Vec<f64>,
+    /// Stream of accepted merges with their scores and (optionally) ΔLL
+    pub merge_trace: Vec<MergeEvent>,
+    /// Periodic snapshots of the score distribution (optional)
+    pub score_snapshots: Vec<ScoreSnapshot>,
+}
+
+/* ------------------------------------------------------------------------- */
 
 struct Config {
     files: Option<(String, String)>,
@@ -191,8 +239,6 @@ impl BpeBuilder {
             })
             .collect::<Result<MergeMap>>()?;
 
-        // merges.insert(pair, (rank as u32, *new_id));
-
         Ok(BPE {
             vocab,
             vocab_r,
@@ -205,6 +251,9 @@ impl BpeBuilder {
             fuse_unk: self.config.fuse_unk,
             byte_fallback: self.config.byte_fallback,
             ignore_merges: self.config.ignore_merges,
+
+            // NEW: start with no telemetry; trainer can enable & fill it
+            telemetry: None,
         })
     }
 }
@@ -236,6 +285,11 @@ pub struct BPE {
     pub byte_fallback: bool,
     /// Whether or not to direct output words if they are part of the vocab.
     pub ignore_merges: bool,
+
+    /* ------------------------------ TELEMETRY ------------------------------ */
+    /// Optional container filled by the trainer when telemetry is requested.
+    pub telemetry: Option<BpeTelemetry>,
+    /* --------------------------------------------------------------------- */
 }
 
 impl std::fmt::Debug for BPE {
@@ -250,6 +304,17 @@ impl std::fmt::Debug for BPE {
             .field("vocab", &self.vocab.len())
             .field("merges", &self.merges.len())
             .field("ignore_merges", &self.ignore_merges)
+            // Don't dump all telemetry; just sizes to keep logs small
+            .field(
+                "telemetry_sizes",
+                &self.telemetry.as_ref().map(|t| {
+                    (
+                        t.merge_trace.len(),
+                        t.score_snapshots.len(),
+                        t.ll.len(),
+                    )
+                }),
+            )
             .finish()
     }
 }
@@ -277,6 +342,7 @@ impl Clone for BPE {
             fuse_unk: self.fuse_unk,
             byte_fallback: self.byte_fallback,
             ignore_merges: self.ignore_merges,
+            telemetry: self.telemetry.clone(),
         }
     }
 }
@@ -377,6 +443,33 @@ impl BPE {
 
     pub fn get_continuing_subword_prefix(&self) -> &Option<String> {
         &self.continuing_subword_prefix
+    }
+
+    /// Ensure telemetry container exists and return a mutable reference.
+    #[inline]
+    pub fn telemetry_mut(&mut self) -> &mut BpeTelemetry {
+        if self.telemetry.is_none() {
+            self.telemetry = Some(BpeTelemetry::default());
+        }
+        self.telemetry.as_mut().unwrap()
+    }
+
+    /// Immutable access to telemetry (if any).
+    #[inline]
+    pub fn telemetry(&self) -> Option<&BpeTelemetry> {
+        self.telemetry.as_ref()
+    }
+
+    /// Clear telemetry buffers (start fresh without affecting vocab/merges).
+    #[inline]
+    pub fn clear_telemetry(&mut self) {
+        self.telemetry = Some(BpeTelemetry::default());
+    }
+
+    /// Take ownership of telemetry buffers, leaving `None` in the model.
+    #[inline]
+    pub fn take_telemetry(&mut self) -> Option<BpeTelemetry> {
+        self.telemetry.take()
     }
 
     fn merge_word(&self, w: &str) -> Result<Word> {

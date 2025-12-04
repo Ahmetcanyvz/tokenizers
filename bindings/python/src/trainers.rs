@@ -186,7 +186,6 @@ fn stop_by_to_py<'py>(py: Python<'py>, s: &BpeStopBy) -> PyObject {
         BpeStopBy::DeltaLLExact => "delta_ll_exact",
         BpeStopBy::DeltaLLApprox => "delta_ll_approx",
     };
-    // pyo3 0.25: convert Bound<'py, PyString> -> Bound<'py, PyAny> -> Py<PyAny> (= PyObject)
     PyString::new(py, tag).into_any().unbind().into()
 }
 
@@ -364,10 +363,62 @@ impl PyBpeTrainer {
         setter!(self_, BpeTrainer, track_ll, flag);
     }
 
+    // ----- telemetry toggles (runtime, optional) -----
+    // Backward compatibility: 'trace_merges' now maps to 'track_ll'
+    #[getter]
+    fn get_trace_merges(self_: PyRef<Self>) -> bool {
+        getter!(self_, BpeTrainer, track_ll)
+    }
+    #[setter]
+    fn set_trace_merges(self_: PyRef<Self>, flag: bool) {
+        setter!(self_, BpeTrainer, track_ll, flag);
+    }
+
+    // Snapshot knobs are Option<usize> in Rust; expose as int with 0 meaning None.
+    #[getter]
+    fn get_score_snapshot_every(self_: PyRef<Self>) -> usize {
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref tr) = *super_.trainer.read().unwrap() {
+            tr.score_snapshot_every.unwrap_or(0)
+        } else {
+            unreachable!()
+        }
+    }
+    #[setter]
+    fn set_score_snapshot_every(self_: PyRef<Self>, every: usize) {
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref mut tr) = *super_.trainer.write().unwrap() {
+            tr.score_snapshot_every = if every == 0 { None } else { Some(every) };
+        }
+    }
+
+    #[getter]
+    fn get_score_sample_size(self_: PyRef<Self>) -> usize {
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref tr) = *super_.trainer.read().unwrap() {
+            tr.score_sample_size.unwrap_or(0)
+        } else {
+            unreachable!()
+        }
+    }
+    #[setter]
+    fn set_score_sample_size(self_: PyRef<Self>, n: usize) {
+        let super_ = self_.as_ref();
+        if let TrainerWrapper::BpeTrainer(ref mut tr) = *super_.trainer.write().unwrap() {
+            tr.score_sample_size = if n == 0 { None } else { Some(n.max(1)) };
+        }
+    }
+
     #[new]
     #[pyo3(
         signature = (**kwargs),
-        text_signature = "(self, vocab_size=30000, min_frequency=0, show_progress=True, special_tokens=[], limit_alphabet=None, initial_alphabet=[], continuing_subword_prefix=None, end_of_word_suffix=None, max_token_length=None, score_by='count', stop_by='vocab_size', track_ll=False)"
+        text_signature = "\
+(self, \
+vocab_size=30000, min_frequency=0, show_progress=True, special_tokens=[], \
+limit_alphabet=None, initial_alphabet=[], continuing_subword_prefix=None, end_of_word_suffix=None, \
+max_token_length=None, \
+score_by='count', stop_by='vocab_size', track_ll=False, \
+trace_merges=False, score_snapshot_every=0, score_sample_size=256)"
     )]
     pub fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::bpe::BpeTrainer::builder();
@@ -375,6 +426,9 @@ impl PyBpeTrainer {
         let mut score_by: Option<BpeScoreBy> = None;
         let mut stop_by: Option<BpeStopBy> = None;
         let mut track_ll: Option<bool> = None;
+        let mut trace_merges: Option<bool> = None;
+        let mut score_snapshot_every: Option<usize> = None;
+        let mut score_sample_size: Option<usize> = None;
 
         if let Some(kwargs) = kwargs {
             for (key, val) in kwargs {
@@ -431,6 +485,20 @@ impl PyBpeTrainer {
                     "track_ll" => {
                         track_ll = Some(val.extract()?);
                     }
+
+                    // telemetry knobs (runtime optional)
+                    "trace_merges" => {
+                        trace_merges = Some(val.extract()?);
+                    }
+                    "score_snapshot_every" => {
+                        let every: usize = val.extract()?;
+                        score_snapshot_every = Some(every);
+                    }
+                    "score_sample_size" => {
+                        let n: usize = val.extract()?;
+                        score_sample_size = Some(n);
+                    }
+
                     _ => println!("Ignored unknown kwargs option {key}"),
                 };
             }
@@ -444,6 +512,16 @@ impl PyBpeTrainer {
         }
         if let Some(flag) = track_ll {
             builder = builder.track_ll(flag);
+        }
+        if let Some(flag) = trace_merges {
+            // Backward-compat: map trace_merges to track_ll in the builder too
+            builder = builder.track_ll(flag);
+        }
+        if let Some(every) = score_snapshot_every {
+            builder = builder.score_snapshot_every(Some(every));
+        }
+        if let Some(n) = score_sample_size {
+            builder = builder.score_sample_size(Some(n));
         }
 
         Ok((PyBpeTrainer {}, builder.build().into()))

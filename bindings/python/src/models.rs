@@ -431,6 +431,78 @@ impl PyBPE {
     fn set_ignore_merges(self_: PyRef<Self>, ignore_merges: bool) {
         setter!(self_, BPE, ignore_merges, ignore_merges);
     }
+
+    /// Return training telemetry collected by the BPE trainer (if any).
+    ///
+    /// Returns a `dict` with:
+    /// - `"ll"`: `List[float]` log-likelihood history (if tracking enabled)
+    /// - `"merge_trace"`: `List[dict]` with per-merge details
+    /// - `"score_snapshots"`: `List[dict]` with `step` and `items=[{pair,score,count}]`
+    #[pyo3(text_signature = "(self)")]
+    fn telemetry(self_: PyRef<Self>, py: Python<'_>) -> PyResult<PyObject> {
+        let super_ = self_.as_ref();
+        let model = super_.model.read().unwrap();
+        if let ModelWrapper::BPE(ref mo) = *model {
+            if let Some(tel) = mo.telemetry() {
+                // ll
+                let ll_py: Vec<f64> = tel.ll.clone();
+
+                // merge_trace -> list[dict]
+                let mut mt: Vec<PyObject> = Vec::with_capacity(tel.merge_trace.len());
+                for ev in &tel.merge_trace {
+                    let d = PyDict::new(py);
+                    d.set_item("step", ev.step)?;
+                    d.set_item("pair", (ev.pair.0, ev.pair.1))?;
+                    d.set_item("new_id", ev.new_id)?;
+                    d.set_item("count", ev.count)?;
+                    d.set_item("score", ev.score)?;
+                    if let Some(dl) = ev.delta_ll {
+                        d.set_item("delta_ll", dl)?;
+                    } else {
+                        d.set_item("delta_ll", py.None())?;
+                    }
+                    // robust conversion across PyO3 versions:
+                    mt.push(d.into_any().unbind().into());
+                }
+
+                // score_snapshots -> list[dict] with items
+                let mut snaps: Vec<PyObject> = Vec::with_capacity(tel.score_snapshots.len());
+                for s in &tel.score_snapshots {
+                    let d = PyDict::new(py);
+                    d.set_item("step", s.step)?;
+                    // items: convert each item
+                    let mut items_py: Vec<PyObject> = Vec::with_capacity(s.items.len());
+                    for it in &s.items {
+                        let di = PyDict::new(py);
+                        di.set_item("pair", (it.pair.0, it.pair.1))?;
+                        di.set_item("score", it.score)?;
+                        di.set_item("count", it.count)?;
+                        items_py.push(di.into_any().unbind().into());
+                    }
+                    d.set_item("items", items_py)?;
+                    snaps.push(d.into_any().unbind().into());
+                }
+
+                let out = PyDict::new(py);
+                out.set_item("ll", ll_py)?;
+                out.set_item("merge_trace", mt)?;
+                out.set_item("score_snapshots", snaps)?;
+                Ok(out.into_any().unbind().into())
+            } else {
+                // Return empty but well-shaped structure
+                let out = PyDict::new(py);
+                out.set_item("ll", Vec::<f64>::new())?;
+                out.set_item("merge_trace", Vec::<PyObject>::new())?;
+                out.set_item("score_snapshots", Vec::<PyObject>::new())?;
+                Ok(out.into_any().unbind().into())
+            }
+        } else {
+            Err(exceptions::PyException::new_err(
+                "Model is not a BPE instance",
+            ))
+        }
+    }
+
     #[new]
     #[pyo3(
         signature = (vocab=None, merges=None, **kwargs),

@@ -712,58 +712,55 @@ impl BpeTrainer {
         let want_snap = snap_every > 0 && snap_size > 0;
         let mut score_snaps: Vec<ScoreSnapshot> = Vec::new();
 
-        // --- NEW: helper — snapshot directly from the selection heap (only real candidates) ---
-        let mut take_heap_snapshot = |step: u32,
-                                      queue: &mut OctonaryHeap<Merge>,
-                                      pair_counts: &AHashMap<Pair, i32>,
-                                      sym_counts: &AHashMap<u32, u64>,
-                                      total_tokens: u64| {
+        // helper: sample the current candidate scores into items (pair, score, count)
+        let mut take_snapshot = |step: u32,
+                                 pair_counts: &AHashMap<Pair, i32>,
+                                 sym_counts: &AHashMap<u32, u64>,
+                                 total_tokens: u64| {
             if !want_snap {
                 return;
             }
-            let target = snap_size.min(queue.len());
+            let n_pairs = pair_counts.len();
+            if n_pairs == 0 {
+                return;
+            }
+            let target = snap_size.min(n_pairs);
             if target == 0 {
                 return;
             }
-
-            let mut pulled: Vec<Merge> = Vec::with_capacity(target);
+            let stride = (n_pairs / target).max(1);
             let mut items: Vec<ScoreItem> = Vec::with_capacity(target);
-
-            for _ in 0..target {
-                if let Some(m) = queue.pop() {
-                    // Refresh from current state (skip if the pair no longer exists)
-                    let cur_cnt_i32 = *pair_counts.get(&m.pair).unwrap_or(&0);
-                    if cur_cnt_i32 > 0 {
-                        let nbc = cur_cnt_i32 as u64;
-                        let nb = *sym_counts.get(&m.pair.0).unwrap_or(&0);
-                        let nc = *sym_counts.get(&m.pair.1).unwrap_or(&0);
-                        let cur_score = match self.scoring {
-                            BpeScoreBy::Count => nbc as f64,
-                            BpeScoreBy::GreedyLLExact => delta_ll_exact(nb, nc, nbc, total_tokens),
-                            BpeScoreBy::GreedyLLApprox => delta_ll_approx(nb, nc, nbc, total_tokens),
-                        };
-                        items.push(ScoreItem {
-                            pair: m.pair,
-                            score: cur_score,
-                            count: nbc,
-                        });
-                    }
-                    pulled.push(m); // keep original entry to restore heap unchanged
-                } else {
+            let mut idx = 0usize;
+            for (pair, cnt_i32) in pair_counts.iter() {
+                if *cnt_i32 <= 0 {
+                    idx += 1;
+                    continue;
+                }
+                if idx % stride == 0 && items.len() < target {
+                    let nbc = *cnt_i32 as u64;
+                    let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
+                    let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
+                    let s = match self.scoring {
+                        BpeScoreBy::Count => nbc as f64,
+                        BpeScoreBy::GreedyLLExact => delta_ll_exact(nb, nc, nbc, total_tokens),
+                        BpeScoreBy::GreedyLLApprox => delta_ll_approx(nb, nc, nbc, total_tokens),
+                    };
+                    items.push(ScoreItem {
+                        pair: *pair,
+                        score: s,
+                        count: nbc,
+                    });
+                }
+                idx += 1;
+                if items.len() == target {
                     break;
                 }
             }
-
-            // Restore heap exactly as it was
-            for m in pulled {
-                queue.push(m);
+            if items.is_empty() {
+                return;
             }
-
-            if !items.is_empty() {
-                score_snaps.push(ScoreSnapshot { step, items });
-            }
+            score_snaps.push(ScoreSnapshot { step, items });
         };
-        // --- end NEW helper ---
 
         loop {
             // Legacy: stop when vocab size reached
@@ -930,6 +927,11 @@ impl BpeTrainer {
                 _ll_history.push(sum - xlogx(total_tokens));
             }
 
+            // Take a score snapshot every `snap_every` accepted merges, if enabled
+            if want_snap && ((step_idx + 1) as usize) % snap_every == 0 {
+                take_snapshot(step_idx + 1, &pair_counts, &sym_counts, total_tokens);
+            }
+
             // Refill both heaps with updated scores for changed pairs
             where_to_update.drain().for_each(|(pair, pos)| {
                 let count = pair_counts[&pair];
@@ -967,11 +969,6 @@ impl BpeTrainer {
                     }
                 }
             });
-
-            // --- Take snapshot AFTER the heap has been refreshed ---
-            if want_snap && ((step_idx + 1) as usize) % snap_every == 0 {
-                take_heap_snapshot(step_idx + 1, &mut queue, &pair_counts, &sym_counts, total_tokens);
-            }
 
             if let Some(p) = &progress {
                 p.inc(1);
