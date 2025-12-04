@@ -92,7 +92,9 @@ struct Merge {
 }
 impl PartialEq for Merge {
     fn eq(&self, other: &Self) -> bool {
-        self.count == other.count && self.pair == other.pair && self.score.to_bits() == other.score.to_bits()
+        self.count == other.count
+            && self.pair == other.pair
+            && self.score.to_bits() == other.score.to_bits()
     }
 }
 // FIX: implement Eq explicitly so we can also implement Ord
@@ -493,12 +495,6 @@ impl BpeTrainer {
         kept.sort_unstable_by_key(|k| *k.0 as u32);
         kept.into_iter().for_each(|(c, _)| {
             let s = c.to_string();
-            /*
-            if !w2id.contains_key(&s) {
-                id2w.push(s.clone());
-                w2id.insert(s, (id2w.len() - 1) as u32);
-            }
-            */
             // u64 hash version
             if !w2id.contains_key(&CompactString::from(&s)) {
                 id2w.push(CompactString::from(&s));
@@ -638,6 +634,18 @@ impl BpeTrainer {
         self.update_progress(&progress, words.len(), "Count pairs");
         let (mut pair_counts, mut where_to_update) = self.count_pairs(&words, &counts, &progress);
 
+        // NEW: persistent map: pair -> positions (words indices)
+        let mut pair_pos: AHashMap<Pair, AHashSet<usize>> = where_to_update.clone();
+
+        // NEW: token -> set of pairs it participates in (for marginal updates)
+        let mut token_pairs: AHashMap<u32, AHashSet<Pair>> = AHashMap::new();
+        for (&pair, &cnt) in pair_counts.iter() {
+            if cnt > 0 {
+                token_pairs.entry(pair.0).or_default().insert(pair);
+                token_pairs.entry(pair.1).or_default().insert(pair);
+            }
+        }
+
         // NEW: compute current symbol counts (n_t) and total tokens N
         let mut sym_counts: AHashMap<u32, u64> = AHashMap::new();
         let mut total_tokens: u64 = 0;
@@ -657,23 +665,26 @@ impl BpeTrainer {
         let mut stop_heap = OctonaryHeap::with_capacity(pair_counts.len());
         let mut stop_scores: AHashMap<Pair, f64> = AHashMap::new();
 
-        where_to_update.drain().for_each(|(pair, pos)| {
-            let count = pair_counts[&pair];
+        // Initial heap build using pair_pos
+        for (pair, pos_set) in pair_pos.iter() {
+            let count = pair_counts[pair];
             if count > 0 {
                 let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
                 let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
                 let sel_score = match self.scoring {
                     BpeScoreBy::Count => count as f64,
-                    BpeScoreBy::GreedyLLExact => delta_ll_exact(nb, nc, count as u64, total_tokens),
+                    BpeScoreBy::GreedyLLExact => {
+                        delta_ll_exact(nb, nc, count as u64, total_tokens)
+                    }
                     BpeScoreBy::GreedyLLApprox => {
                         delta_ll_approx(nb, nc, count as u64, total_tokens)
                     }
                 };
                 queue.push(Merge {
-                    pair,
+                    pair: *pair,
                     count: count as u64,
                     score: sel_score,
-                    pos,
+                    pos: pos_set.clone(),
                 });
 
                 if use_delta_stop {
@@ -686,11 +697,13 @@ impl BpeTrainer {
                         }
                         BpeStopBy::VocabSize => 0.0,
                     };
-                    stop_heap.push(BestItem { pair, score: s });
-                    stop_scores.insert(pair, s);
+                    stop_heap.push(BestItem { pair: *pair, score: s });
+                    stop_scores.insert(*pair, s);
                 }
             }
-        });
+        }
+        // from now on, where_to_update is only a "delta" aggregator
+        where_to_update.clear();
         self.finalize_progress(&progress, words.len());
 
         // 5. Do merges
@@ -896,7 +909,6 @@ impl BpeTrainer {
                         assert!(i < words_len);
                         // This is words[i], but avoids needing to go through &T (which triggers UB)
                         let word = word_start.0.add(i);
-                        // let word: &mut Word = &mut (*word);
                         (*word)
                             .merge(top.pair.0, top.pair.1, new_token_id, max_token_length)
                             .into_iter()
@@ -906,12 +918,15 @@ impl BpeTrainer {
                 })
                 .collect::<Vec<_>>();
 
-            // Introduce new formed pairs; accumulate where_to_update
+            // Introduce new formed pairs; accumulate where_to_update and indexes
             for ((pair, change), iw) in changes {
                 let count = change * counts[iw] as i32;
                 *pair_counts.entry(pair).or_default() += count;
                 if change > 0 {
                     where_to_update.entry(pair).or_default().insert(iw);
+                    pair_pos.entry(pair).or_default().insert(iw);
+                    token_pairs.entry(pair.0).or_default().insert(pair);
+                    token_pairs.entry(pair.1).or_default().insert(pair);
                 }
             }
 
@@ -930,10 +945,30 @@ impl BpeTrainer {
                 _ll_history.push(sum - xlogx(total_tokens));
             }
 
+            // Mark all pairs touching changed tokens (lhs, rhs, new token) as dirty for rescore
+            {
+                let changed_tokens = [top.pair.0, top.pair.1, new_token_id];
+                for t in changed_tokens {
+                    if let Some(ps) = token_pairs.get(&t) {
+                        for &p in ps {
+                            if pair_counts.get(&p).copied().unwrap_or(0) > 0 {
+                                where_to_update.entry(p).or_default();
+                            }
+                        }
+                    }
+                }
+            }
+
             // Refill both heaps with updated scores for changed pairs
-            where_to_update.drain().for_each(|(pair, pos)| {
+            where_to_update.drain().for_each(|(pair, new_pos)| {
                 let count = pair_counts[&pair];
                 if count > 0 {
+                    // Update stored positions for this pair
+                    let pos_ref = pair_pos.entry(pair).or_insert_with(AHashSet::new);
+                    for iw in new_pos {
+                        pos_ref.insert(iw);
+                    }
+
                     let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
                     let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
                     let sel_score = match self.scoring {
@@ -949,7 +984,7 @@ impl BpeTrainer {
                         pair,
                         count: count as u64,
                         score: sel_score,
-                        pos,
+                        pos: pos_ref.clone(),
                     });
 
                     if use_delta_stop {
@@ -970,7 +1005,13 @@ impl BpeTrainer {
 
             // --- Take snapshot AFTER the heap has been refreshed ---
             if want_snap && ((step_idx + 1) as usize) % snap_every == 0 {
-                take_heap_snapshot(step_idx + 1, &mut queue, &pair_counts, &sym_counts, total_tokens);
+                take_heap_snapshot(
+                    step_idx + 1,
+                    &mut queue,
+                    &pair_counts,
+                    &sym_counts,
+                    total_tokens,
+                );
             }
 
             if let Some(p) = &progress {
@@ -980,7 +1021,6 @@ impl BpeTrainer {
         self.finalize_progress(&progress, merges.len());
 
         // Transfer new vocab & options to model
-        //model.vocab = word_to_id;
         model.vocab = word_to_id
             .into_iter()
             // we have to look up the string in id_to_word because the key in word_to_id is a hash
@@ -1136,6 +1176,7 @@ mod tests {
         .collect();
         assert_eq!(model.merges, expected_merges);
     }
+
     #[test]
     fn bpe_test_max_token_length_16() {
         /* bpe_test_max_token_length series of tests test the max_token_length flag of bpetrainer
@@ -1178,6 +1219,7 @@ mod tests {
             )
         }
     }
+
     #[test]
     fn bpe_test_max_token_length_direct_assert() {
         /* more direct version of bpe_test_max_token_length test

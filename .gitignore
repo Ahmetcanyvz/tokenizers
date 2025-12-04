@@ -29,3 +29,12 @@ pip-wheel-metadata
 /results_100k/*
 /results_50k/*
 /old_toks/*
+old_toks/
+out_bpe_approx_ll/
+out_bpe_exact_ll/
+results_token_counts/
+*.gif
+*.mp4
+*.png
+*.ipynb_checkpoints/
+
