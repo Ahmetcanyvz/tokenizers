@@ -24,3 +24,7 @@ pip-wheel-metadata
 
 .vscode
 *.code-workspace
+
+.json
+
+/fineweb_data/*fineweb_data/
