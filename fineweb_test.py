@@ -29,7 +29,7 @@ from typing import Iterable, List, Optional
 
 # ---------- CONFIG ----------
 DATASET_PATH = "/Users/ahmetcanyavuz/Developer/tokenizers/fineweb_data/fineweb_en_sentences.txt"
-RESULTS_DIR  = "./results_100k"
+RESULTS_DIR  = "./results_100k_fixed"
 VOCAB_SIZE   = 100_000
 MIN_FREQ     = 2
 
