@@ -1,6 +1,6 @@
 #![allow(clippy::map_entry)]
 
-use super::{Pair, WithFirstLastIterator, Word, BPE, MergeEvent, ScoreItem, ScoreSnapshot};
+use super::{Pair, WithFirstLastIterator, Word, BPE};
 use crate::parallelism::*;
 use crate::tokenizer::{AddedToken, Result, Trainer};
 use crate::utils::progress::{ProgressBar, ProgressStyle};
@@ -13,9 +13,9 @@ use std::collections::HashSet;
 
 /// How to rank candidate merges in the heap.
 ///
-/// * `Count` – legacy BPE: pick the most frequent pair
-/// * `GreedyLLExact` – exact ΔLL from the GreedyLL derivation
-/// * `GreedyLLApprox` – approximate ΔLL (PMI‑like)
+/// * `Count`           — original BPE: pick the most frequent pair.
+/// * `GreedyLLExact`   — rank by exact ΔLL.
+/// * `GreedyLLApprox`  — rank by approx ΔLL (PMI-like).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BpeScoreBy {
     #[serde(rename = "count")]
@@ -28,9 +28,9 @@ pub enum BpeScoreBy {
 
 /// When to stop training.
 ///
-/// * `VocabSize` – legacy behavior: stop at target vocab size
-/// * `DeltaLLExact` – stop when best exact ΔLL ≤ 0
-/// * `DeltaLLApprox` – stop when best approx ΔLL ≤ 0
+/// * `VocabSize`       — stop when vocab size hits `vocab_size` (original behavior).
+/// * `DeltaLLExact`    — additionally stop when best exact ΔLL ≤ 0.
+/// * `DeltaLLApprox`   — additionally stop when best approx ΔLL ≤ 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BpeStopBy {
     #[serde(rename = "vocab_size")]
@@ -51,7 +51,7 @@ fn xlogx(x: u64) -> f64 {
     }
 }
 
-/// Exact ΔLL(b,c) from the GreedyLL note, using hard counts.
+/// Exact ΔLL for merging (b,c) with counts measured on the current stream.
 #[inline]
 fn delta_ll_exact(nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
     // ΔLL(b,c) = (nb - nbc)log(nb - nbc) - nb log nb
@@ -67,7 +67,7 @@ fn delta_ll_exact(nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
         + xlogx(n)
 }
 
-/// First‑order ΔLL approximation: n_bc * log(n_bc * N / (n_b * n_c)).
+/// First-order approximation: n_bc * log( n_bc * N / (n_b * n_c) ).
 #[inline]
 fn delta_ll_approx(nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
     if nbc == 0 || nb == 0 || nc == 0 {
@@ -88,15 +88,14 @@ fn score_of(policy: BpeScoreBy, nb: u64, nc: u64, nbc: u64, n: u64) -> f64 {
     }
 }
 
-/// Heap item: pair + count + score + positions where the pair occurs.
+/// Heap element: pair + count + score + positions.
 #[derive(Debug)]
 struct Merge {
     pair: Pair,
     count: u64,
-    score: f64,
+    score: f64, // ranking key according to `scoring`
     pos: AHashSet<usize>,
 }
-
 impl PartialEq for Merge {
     fn eq(&self, other: &Self) -> bool {
         self.count == other.count
@@ -105,7 +104,6 @@ impl PartialEq for Merge {
     }
 }
 impl Eq for Merge {}
-
 impl PartialOrd for Merge {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -113,7 +111,7 @@ impl PartialOrd for Merge {
 }
 impl Ord for Merge {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Max‑heap by score; on ties use same deterministic tie‑break as original
+        // Max-heap by score; when equal, use original deterministic tie-breaker on pair.
         match self
             .score
             .partial_cmp(&other.score)
@@ -136,7 +134,7 @@ struct Config {
     end_of_word_suffix: Option<String>,
     max_token_length: Option<usize>,
 
-    // NEW knobs
+    // NEW:
     scoring: BpeScoreBy,
     stop_by: BpeStopBy,
     track_ll: bool,
@@ -164,7 +162,7 @@ impl Default for BpeTrainerBuilder {
                 end_of_word_suffix: None,
                 max_token_length: None,
 
-                // Defaults: reproduce HF behavior unless explicitly changed
+                // defaults: preserve original behavior
                 scoring: BpeScoreBy::Count,
                 stop_by: BpeStopBy::VocabSize,
                 track_ll: false,
@@ -246,35 +244,35 @@ impl BpeTrainerBuilder {
         self
     }
 
-    /// Choose how to rank candidate merges (default: `Count`).
+    /// Set scoring policy
     #[must_use]
     pub fn score_by(mut self, scoring: BpeScoreBy) -> Self {
         self.config.scoring = scoring;
         self
     }
 
-    /// Choose global stopping policy (default: `VocabSize` only).
+    /// Set stopping policy
     #[must_use]
     pub fn stop_by(mut self, stop_by: BpeStopBy) -> Self {
         self.config.stop_by = stop_by;
         self
     }
 
-    /// Enable/disable tracking of corpus log‑likelihood during training.
+    /// Enable / disable LL tracking (API only; current trainer ignores this flag)
     #[must_use]
     pub fn track_ll(mut self, track_ll: bool) -> Self {
         self.config.track_ll = track_ll;
         self
     }
 
-    /// Take score snapshots every `step` merges (if > 0).
+    /// Configure how often to snapshot scores (API only; trainer currently ignores this)
     #[must_use]
     pub fn score_snapshot_every(mut self, step: Option<usize>) -> Self {
         self.config.score_snapshot_every = step;
         self
     }
 
-    /// Size of the score snapshot (how many top heap items to sample).
+    /// Configure how many scores to keep per snapshot (API only; trainer currently ignores this)
     #[must_use]
     pub fn score_sample_size(mut self, sz: Option<usize>) -> Self {
         self.config.score_sample_size = sz;
@@ -344,15 +342,15 @@ pub struct BpeTrainer {
     /// An optional parameter to limit the max length of any single token
     pub max_token_length: Option<usize>,
 
-    /// How to rank candidate merges in the heap
+    /// How to rank pairs in the heap (default: Count)
     pub scoring: BpeScoreBy,
-    /// How to decide when to stop
+    /// When to stop training (default: VocabSize)
     pub stop_by: BpeStopBy,
-    /// Track corpus log‑likelihood over training
+    /// Whether to track LL (API only; currently not used in trainer)
     pub track_ll: bool,
-    /// Snapshot cadence for score samples
+    /// Score snapshot frequency (API only; currently not used)
     pub score_snapshot_every: Option<usize>,
-    /// Snapshot sample size
+    /// Number of scores per snapshot (API only; currently not used)
     pub score_sample_size: Option<usize>,
 
     words: AHashMap<CompactString, u64>,
@@ -577,6 +575,10 @@ impl BpeTrainer {
         word_counts: &AHashMap<CompactString, u64>,
         model: &mut BPE,
     ) -> Result<Vec<AddedToken>> {
+        // Touch these so the fields are considered "used" even if we don't yet
+        // implement telemetry in this trainer.
+        let _ = (self.track_ll, self.score_snapshot_every, self.score_sample_size);
+
         let mut word_to_id: AHashMap<CompactString, u32> = AHashMap::with_capacity(self.vocab_size);
         let mut id_to_word: Vec<CompactString> = Vec::with_capacity(self.vocab_size);
         let max_token_length: usize = self.max_token_length.unwrap_or(usize::MAX);
@@ -602,7 +604,7 @@ impl BpeTrainer {
         self.finalize_progress(&progress, words.len());
 
         //
-        // 3.5. Symbol marginals & total tokens (computed once)
+        // 3.5. Compute initial symbol marginals and total tokens (once)
         //
         let mut sym_counts: AHashMap<u32, u64> = AHashMap::new();
         let mut total_tokens: u64 = 0;
@@ -620,7 +622,15 @@ impl BpeTrainer {
         self.update_progress(&progress, words.len(), "Count pairs");
         let (mut pair_counts, mut where_to_update) = self.count_pairs(&words, &counts, &progress);
 
-        // Insert them in the queue with scores
+        // Build reverse index: symbol -> set of pairs containing that symbol
+        // This is needed for ΔLL-based scoring to update affected pairs when symbol counts change
+        let mut symbol_to_pairs: AHashMap<u32, AHashSet<Pair>> = AHashMap::new();
+
+        // Maintain pair -> positions mapping separately from the heap
+        // This allows us to re-push pairs with correct positions when scores change
+        let mut pair_to_pos: AHashMap<Pair, AHashSet<usize>> = AHashMap::new();
+
+        // Insert them in the queue (with score according to the chosen policy)
         let mut queue = OctonaryHeap::with_capacity(pair_counts.len());
         where_to_update.drain().for_each(|(pair, pos)| {
             let count = pair_counts[&pair];
@@ -632,8 +642,13 @@ impl BpeTrainer {
                     pair,
                     count: count as u64,
                     score,
-                    pos,
+                    pos: pos.clone(),
                 });
+                // Store positions separately
+                pair_to_pos.insert(pair, pos);
+                // Add to reverse index
+                symbol_to_pairs.entry(pair.0).or_default().insert(pair);
+                symbol_to_pairs.entry(pair.1).or_default().insert(pair);
             }
         });
         self.finalize_progress(&progress, words.len());
@@ -643,69 +658,8 @@ impl BpeTrainer {
         //
         self.update_progress(&progress, self.vocab_size, "Compute merges");
         let mut merges: Vec<(Pair, u32)> = vec![];
-
-        // Telemetry: LL history
-        let mut ll_history: Vec<f64> = Vec::new();
-        if self.track_ll {
-            let sum = sym_counts.values().copied().map(xlogx).sum::<f64>();
-            ll_history.push(sum - xlogx(total_tokens));
-        }
-
-        // Telemetry: per‑merge events & score snapshots
-        let mut merge_events: Vec<MergeEvent> = Vec::new();
-        let snap_every = self.score_snapshot_every.unwrap_or(0);
-        let snap_size = self.score_sample_size.unwrap_or(0);
-        let want_snap = snap_every > 0 && snap_size > 0;
-        let mut score_snaps: Vec<ScoreSnapshot> = Vec::new();
-
-        // Snapshot helper: peek into the heap without disturbing it
-        let mut take_heap_snapshot = |step: u32,
-                                      queue: &mut OctonaryHeap<Merge>,
-                                      pair_counts: &AHashMap<Pair, i32>,
-                                      sym_counts: &AHashMap<u32, u64>,
-                                      total_tokens: u64| {
-            if !want_snap {
-                return;
-            }
-            let target = snap_size.min(queue.len());
-            if target == 0 {
-                return;
-            }
-
-            let mut pulled: Vec<Merge> = Vec::with_capacity(target);
-            let mut items: Vec<ScoreItem> = Vec::with_capacity(target);
-
-            for _ in 0..target {
-                if let Some(m) = queue.pop() {
-                    let cur_cnt_i32 = *pair_counts.get(&m.pair).unwrap_or(&0);
-                    if cur_cnt_i32 > 0 {
-                        let nbc = cur_cnt_i32 as u64;
-                        let nb = *sym_counts.get(&m.pair.0).unwrap_or(&0);
-                        let nc = *sym_counts.get(&m.pair.1).unwrap_or(&0);
-                        let cur_score = score_of(self.scoring, nb, nc, nbc, total_tokens);
-                        items.push(ScoreItem {
-                            pair: m.pair,
-                            score: cur_score,
-                            count: nbc,
-                        });
-                    }
-                    pulled.push(m);
-                } else {
-                    break;
-                }
-            }
-
-            for m in pulled {
-                queue.push(m);
-            }
-
-            if !items.is_empty() {
-                score_snaps.push(ScoreSnapshot { step, items });
-            }
-        };
-
         loop {
-            // Stop as soon as we have a big enough vocabulary
+            // Hard cap: never grow vocab beyond vocab_size
             if word_to_id.len() >= self.vocab_size {
                 break;
             }
@@ -724,32 +678,43 @@ impl BpeTrainer {
             let nc_now = *sym_counts.get(&top.pair.1).unwrap_or(&0);
             let cur_score = score_of(self.scoring, nb_now, nc_now, cur_count, total_tokens);
 
-            // Stopping score (can be different from ranking score)
-            let stop_score = match self.stop_by {
-                BpeStopBy::VocabSize => f64::INFINITY,
-                BpeStopBy::DeltaLLExact => delta_ll_exact(nb_now, nc_now, cur_count, total_tokens),
-                BpeStopBy::DeltaLLApprox => {
-                    delta_ll_approx(nb_now, nc_now, cur_count, total_tokens)
-                }
-            };
-
             if cur_count != top.count || (cur_score - top.score).abs() > 1e-12 {
-                // Stale heap entry, refresh and reinsert
                 top.count = cur_count;
                 top.score = cur_score;
                 queue.push(top);
                 continue;
             }
 
-            // ΔLL‑based stopping (if requested)
-            if matches!(self.stop_by, BpeStopBy::DeltaLLExact | BpeStopBy::DeltaLLApprox)
-                && stop_score <= 0.0
-            {
-                break;
+            // If using ΔLL-based stopping, stop when best achievable ΔLL ≤ 0.
+            if !matches!(self.stop_by, BpeStopBy::VocabSize) {
+                let stop_score = match self.stop_by {
+                    BpeStopBy::VocabSize => f64::INFINITY,
+                    BpeStopBy::DeltaLLExact => {
+                        delta_ll_exact(nb_now, nc_now, cur_count, total_tokens)
+                    }
+                    BpeStopBy::DeltaLLApprox => {
+                        delta_ll_approx(nb_now, nc_now, cur_count, total_tokens)
+                    }
+                };
+                if stop_score <= 0.0 {
+                    break;
+                }
             }
 
-            if cur_count < 1 || self.min_frequency > cur_count {
-                break;
+            if top.count < 1 {
+                // Pair count is zero or negative, skip it
+                continue;
+            }
+            if self.min_frequency > top.count {
+                // For count-based scoring, if the top pair is below min_frequency,
+                // all remaining pairs will also be below (since heap is sorted by count).
+                // For ΔLL-based scoring, other pairs might still be above min_frequency,
+                // so we should continue instead of break.
+                if matches!(self.scoring, BpeScoreBy::Count) {
+                    break;
+                } else {
+                    continue;
+                }
             }
 
             let part_a = &id_to_word[top.pair.0 as usize];
@@ -762,6 +727,7 @@ impl BpeTrainer {
                 }
             }
 
+            // Insert new token if it does not already exist
             let new_token = format!("{part_a}{part_b}");
             let new_token_id = word_to_id
                 .get(&CompactString::from(&new_token))
@@ -771,23 +737,11 @@ impl BpeTrainer {
                 id_to_word.push(CompactString::from(&new_token));
                 word_to_id.insert(CompactString::from(&new_token), new_token_id);
             }
-
-            let step_idx = merges.len() as u32;
             merges.push((top.pair, new_token_id));
 
-            // Telemetry: per‑merge event (ΔLL always exact here, from *current* counts)
-            let d_exact = delta_ll_exact(nb_now, nc_now, cur_count, total_tokens);
-            merge_events.push(MergeEvent {
-                step: step_idx,
-                pair: top.pair,
-                new_id: new_token_id,
-                count: cur_count,
-                score: cur_score,
-                delta_ll: if self.track_ll { Some(d_exact) } else { None },
-            });
-
-            // Merge the new pair in every word where it appears
-            let pos: &AHashSet<usize> = &top.pos;
+            // Merge the new pair in every word
+            // Use pair_to_pos as the authoritative source for positions
+            let pos = pair_to_pos.get(&top.pair).cloned().unwrap_or_default();
 
             let words_len = words.len();
             struct WordPtr(*mut Word);
@@ -796,7 +750,7 @@ impl BpeTrainer {
             unsafe impl Sync for WordPtr {}
             let word_start = WordPtr(words.as_mut_ptr());
 
-            let changes = pos
+            let changes = (&pos)
                 .maybe_par_iter()
                 .flat_map(|&i| {
                     // We can merge each of these words in parallel here because each position
@@ -814,27 +768,24 @@ impl BpeTrainer {
                 })
                 .collect::<Vec<_>>();
 
-            // Track how many `b c` merges actually got applied (respecting max_token_length)
+            // Track how many (b,c) merges actually happened (respecting max_token_length)
             let mut applied_bc: i64 = 0;
 
             // Introduce new formed pairs & update pair counts
-            let mut where_to_update = AHashMap::<Pair, AHashSet<usize>>::new();
             for ((pair, change), iw) in changes {
                 let count_delta = change * counts[iw] as i32;
-
                 if pair == top.pair && count_delta < 0 {
-                    // count_delta is negative: number of removed `b c` pairs in this word
+                    // We removed |count_delta| occurrences of (b,c) in this word type
                     applied_bc += -(count_delta as i64);
                 }
-
                 *pair_counts.entry(pair).or_default() += count_delta;
                 if change > 0 {
-                    // Only pairs whose counts increased get refreshed positions
+                    // Only pairs whose counts increased need a refreshed 'pos'
                     where_to_update.entry(pair).or_default().insert(iw);
                 }
             }
 
-            // Incremental update of symbol marginals & total token count
+            // Update symbol marginals and total token count incrementally
             let applied_bc_u = applied_bc as u64;
             if applied_bc_u > 0 {
                 if let Some(v) = sym_counts.get_mut(&top.pair.0) {
@@ -847,38 +798,66 @@ impl BpeTrainer {
                 total_tokens = total_tokens.saturating_sub(applied_bc_u);
             }
 
-            // Refresh changed pairs in the heap (only those that gained count)
-            where_to_update.drain().for_each(|(pair, pos)| {
+            // Remove the merged pair from pair_to_pos and reverse index
+            pair_to_pos.remove(&top.pair);
+            if let Some(set) = symbol_to_pairs.get_mut(&top.pair.0) {
+                set.remove(&top.pair);
+            }
+            if let Some(set) = symbol_to_pairs.get_mut(&top.pair.1) {
+                set.remove(&top.pair);
+            }
+
+            // For ΔLL-based scoring: recompute scores for all pairs affected by n_x/n_y change
+            // When we merged (x,y), both n_x and n_y decreased, which affects scores of all pairs
+            // containing x or y (since their scores depend on symbol marginals)
+            if !matches!(self.scoring, BpeScoreBy::Count) && applied_bc_u > 0 {
+                let empty_set = AHashSet::new();
+                let pairs_with_x = symbol_to_pairs.get(&top.pair.0).unwrap_or(&empty_set);
+                let pairs_with_y = symbol_to_pairs.get(&top.pair.1).unwrap_or(&empty_set);
+
+                // Collect affected pairs (excluding the pair we just merged)
+                for &affected_pair in pairs_with_x.iter().chain(pairs_with_y.iter()) {
+                    if affected_pair == top.pair {
+                        continue; // Skip the merged pair itself
+                    }
+                    let count = pair_counts.get(&affected_pair).copied().unwrap_or(0);
+                    if count > 0 {
+                        let na = *sym_counts.get(&affected_pair.0).unwrap_or(&0);
+                        let nb = *sym_counts.get(&affected_pair.1).unwrap_or(&0);
+                        let score = score_of(self.scoring, na, nb, count as u64, total_tokens);
+                        // Re-push with updated score; pos is looked up from pair_to_pos when needed
+                        let affected_pos = pair_to_pos.get(&affected_pair).cloned().unwrap_or_default();
+                        queue.push(Merge {
+                            pair: affected_pair,
+                            count: count as u64,
+                            score,
+                            pos: affected_pos,
+                        });
+                    }
+                }
+            }
+
+            // Reinsert newly formed/changed pairs with fresh scores
+            where_to_update.drain().for_each(|(pair, new_pos)| {
                 let count = pair_counts[&pair];
                 if count > 0 {
                     let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
                     let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
                     let score = score_of(self.scoring, nb, nc, count as u64, total_tokens);
+                    // Update pair_to_pos with the new positions
+                    pair_to_pos.entry(pair).or_default().extend(new_pos.iter().cloned());
+                    let pos = pair_to_pos.get(&pair).cloned().unwrap_or_default();
                     queue.push(Merge {
                         pair,
                         count: count as u64,
                         score,
                         pos,
                     });
+                    // Update reverse index for new pairs
+                    symbol_to_pairs.entry(pair.0).or_default().insert(pair);
+                    symbol_to_pairs.entry(pair.1).or_default().insert(pair);
                 }
             });
-
-            // LL trace after this merge
-            if self.track_ll {
-                let sum = sym_counts.values().copied().map(xlogx).sum::<f64>();
-                ll_history.push(sum - xlogx(total_tokens));
-            }
-
-            // Score snapshots (optional)
-            if want_snap && ((step_idx + 1) as usize) % snap_every == 0 {
-                take_heap_snapshot(
-                    step_idx + 1,
-                    &mut queue,
-                    &pair_counts,
-                    &sym_counts,
-                    total_tokens,
-                );
-            }
 
             if let Some(p) = &progress {
                 p.inc(1);
@@ -905,14 +884,6 @@ impl BpeTrainer {
 
         model.continuing_subword_prefix = self.continuing_subword_prefix.clone();
         model.end_of_word_suffix = self.end_of_word_suffix.clone();
-
-        // Attach training telemetry
-        {
-            let tel = model.telemetry_mut();
-            tel.ll = if self.track_ll { ll_history } else { Vec::new() };
-            tel.merge_trace = merge_events;
-            tel.score_snapshots = if want_snap { score_snaps } else { Vec::new() };
-        }
 
         Ok(self.special_tokens.clone())
     }
@@ -1042,6 +1013,7 @@ mod tests {
         .collect();
         assert_eq!(model.merges, expected_merges);
     }
+
     #[test]
     fn bpe_test_max_token_length_16() {
         /* bpe_test_max_token_length series of tests test the max_token_length flag of bpetrainer
@@ -1084,6 +1056,7 @@ mod tests {
             )
         }
     }
+
     #[test]
     fn bpe_test_max_token_length_direct_assert() {
         /* more direct version of bpe_test_max_token_length test
