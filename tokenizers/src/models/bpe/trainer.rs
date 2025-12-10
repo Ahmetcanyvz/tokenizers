@@ -1,6 +1,6 @@
 #![allow(clippy::map_entry)]
 
-use super::{Pair, WithFirstLastIterator, Word, BPE};
+use super::{BpeTelemetry, MergeEvent, Pair, ScoreItem, ScoreSnapshot, WithFirstLastIterator, Word, BPE};
 use crate::parallelism::*;
 use crate::tokenizer::{AddedToken, Result, Trainer};
 use crate::utils::progress::{ProgressBar, ProgressStyle};
@@ -575,9 +575,14 @@ impl BpeTrainer {
         word_counts: &AHashMap<CompactString, u64>,
         model: &mut BPE,
     ) -> Result<Vec<AddedToken>> {
-        // Touch these so the fields are considered "used" even if we don't yet
-        // implement telemetry in this trainer.
-        let _ = (self.track_ll, self.score_snapshot_every, self.score_sample_size);
+        // Initialize telemetry if tracking is enabled
+        let mut telemetry = if self.track_ll {
+            Some(BpeTelemetry::default())
+        } else {
+            None
+        };
+        let snapshot_every = self.score_snapshot_every.unwrap_or(0);
+        let snapshot_sample_size = self.score_sample_size.unwrap_or(10_000);
 
         let mut word_to_id: AHashMap<CompactString, u32> = AHashMap::with_capacity(self.vocab_size);
         let mut id_to_word: Vec<CompactString> = Vec::with_capacity(self.vocab_size);
@@ -658,6 +663,7 @@ impl BpeTrainer {
         //
         self.update_progress(&progress, self.vocab_size, "Compute merges");
         let mut merges: Vec<(Pair, u32)> = vec![];
+        let mut merge_step: u32 = 0;
         loop {
             // Hard cap: never grow vocab beyond vocab_size
             if word_to_id.len() >= self.vocab_size {
@@ -669,7 +675,12 @@ impl BpeTrainer {
             };
 
             // Lazy refresh of count & score for the popped top
-            let cur_count = pair_counts.get(&top.pair).copied().unwrap_or(0) as u64;
+            // Note: pair_counts uses i32, so we must handle negative values (treat as 0)
+            let cur_count = pair_counts
+                .get(&top.pair)
+                .copied()
+                .unwrap_or(0)
+                .max(0) as u64;
             if cur_count == 0 {
                 // Pair disappeared, skip
                 continue;
@@ -739,6 +750,60 @@ impl BpeTrainer {
             }
             merges.push((top.pair, new_token_id));
 
+            // Record telemetry for this merge
+            if let Some(ref mut tel) = telemetry {
+                // Compute exact ΔLL for telemetry (even if scoring uses approx)
+                let delta_ll_value = delta_ll_exact(nb_now, nc_now, cur_count, total_tokens);
+                tel.merge_trace.push(MergeEvent {
+                    step: merge_step,
+                    pair: top.pair,
+                    new_id: new_token_id,
+                    count: cur_count,
+                    score: cur_score,
+                    delta_ll: Some(delta_ll_value),
+                    total_tokens: Some(total_tokens),
+                    n_a: Some(nb_now),
+                    n_b: Some(nc_now),
+                });
+
+                // Take score snapshot periodically
+                if snapshot_every > 0 && merge_step % snapshot_every as u32 == 0 {
+                    // Sample top candidates from the queue
+                    // We need to peek at the heap without modifying it, so we collect and re-push
+                    let mut sampled_items: Vec<ScoreItem> = Vec::new();
+                    let mut temp_popped: Vec<Merge> = Vec::new();
+
+                    // Pop up to snapshot_sample_size items
+                    for _ in 0..snapshot_sample_size {
+                        if let Some(m) = queue.pop() {
+                            // Check if this entry is still valid
+                            let pc = pair_counts.get(&m.pair).copied().unwrap_or(0);
+                            if pc > 0 {
+                                sampled_items.push(ScoreItem {
+                                    pair: m.pair,
+                                    score: m.score,
+                                    count: m.count,
+                                });
+                            }
+                            temp_popped.push(m);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Re-push all popped items
+                    for m in temp_popped {
+                        queue.push(m);
+                    }
+
+                    tel.score_snapshots.push(ScoreSnapshot {
+                        step: merge_step,
+                        items: sampled_items,
+                    });
+                }
+            }
+            merge_step += 1;
+
             // Merge the new pair in every word
             // Use pair_to_pos as the authoritative source for positions
             let pos = pair_to_pos.get(&top.pair).cloned().unwrap_or_default();
@@ -750,34 +815,39 @@ impl BpeTrainer {
             unsafe impl Sync for WordPtr {}
             let word_start = WordPtr(words.as_mut_ptr());
 
-            let changes = (&pos)
+            // Collect both changes and merge counts from each word
+            let results: Vec<(Vec<((Pair, i32), usize)>, u64)> = (&pos)
                 .maybe_par_iter()
-                .flat_map(|&i| {
+                .map(|&i| {
                     // We can merge each of these words in parallel here because each position
                     // can be there only once (AHashSet). So this is safe.
                     unsafe {
                         assert!(i < words_len);
                         // This is words[i], but avoids needing to go through &T (which triggers UB)
                         let word = word_start.0.add(i);
-                        (*word)
-                            .merge(top.pair.0, top.pair.1, new_token_id, max_token_length)
-                            .into_iter()
-                            .map(|c| (c, i))
-                            .collect::<Vec<_>>()
+                        let (changes, merge_count) =
+                            (*word).merge(top.pair.0, top.pair.1, new_token_id, max_token_length);
+                        let word_freq = counts[i];
+                        // Actual token reduction = merge_count * word_frequency
+                        let token_reduction = (merge_count as u64) * word_freq;
+                        let changes_with_word_idx: Vec<((Pair, i32), usize)> =
+                            changes.into_iter().map(|c| (c, i)).collect();
+                        (changes_with_word_idx, token_reduction)
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
-            // Track how many (b,c) merges actually happened (respecting max_token_length)
-            let mut applied_bc: i64 = 0;
+            // Aggregate changes and total token reduction
+            let mut changes: Vec<((Pair, i32), usize)> = Vec::new();
+            let mut applied_bc: u64 = 0;
+            for (word_changes, token_reduction) in results {
+                changes.extend(word_changes);
+                applied_bc += token_reduction;
+            }
 
             // Introduce new formed pairs & update pair counts
             for ((pair, change), iw) in changes {
                 let count_delta = change * counts[iw] as i32;
-                if pair == top.pair && count_delta < 0 {
-                    // We removed |count_delta| occurrences of (b,c) in this word type
-                    applied_bc += -(count_delta as i64);
-                }
                 *pair_counts.entry(pair).or_default() += count_delta;
                 if change > 0 {
                     // Only pairs whose counts increased need a refreshed 'pos'
@@ -785,17 +855,20 @@ impl BpeTrainer {
                 }
             }
 
+            // Remove the merged pair from pair_counts entirely (it's been fully consumed)
+            pair_counts.remove(&top.pair);
+
             // Update symbol marginals and total token count incrementally
-            let applied_bc_u = applied_bc as u64;
-            if applied_bc_u > 0 {
+            if applied_bc > 0 {
                 if let Some(v) = sym_counts.get_mut(&top.pair.0) {
-                    *v = v.saturating_sub(applied_bc_u);
+                    *v = v.saturating_sub(applied_bc);
                 }
                 if let Some(v) = sym_counts.get_mut(&top.pair.1) {
-                    *v = v.saturating_sub(applied_bc_u);
+                    *v = v.saturating_sub(applied_bc);
                 }
-                *sym_counts.entry(new_token_id).or_default() += applied_bc_u;
-                total_tokens = total_tokens.saturating_sub(applied_bc_u);
+                let new_sym_count = sym_counts.entry(new_token_id).or_default();
+                *new_sym_count = new_sym_count.saturating_add(applied_bc);
+                total_tokens = total_tokens.saturating_sub(applied_bc);
             }
 
             // Remove the merged pair from pair_to_pos and reverse index
@@ -810,7 +883,7 @@ impl BpeTrainer {
             // For ΔLL-based scoring: recompute scores for all pairs affected by n_x/n_y change
             // When we merged (x,y), both n_x and n_y decreased, which affects scores of all pairs
             // containing x or y (since their scores depend on symbol marginals)
-            if !matches!(self.scoring, BpeScoreBy::Count) && applied_bc_u > 0 {
+            if !matches!(self.scoring, BpeScoreBy::Count) && applied_bc > 0 {
                 let empty_set = AHashSet::new();
                 let pairs_with_x = symbol_to_pairs.get(&top.pair.0).unwrap_or(&empty_set);
                 let pairs_with_y = symbol_to_pairs.get(&top.pair.1).unwrap_or(&empty_set);
@@ -820,16 +893,16 @@ impl BpeTrainer {
                     if affected_pair == top.pair {
                         continue; // Skip the merged pair itself
                     }
-                    let count = pair_counts.get(&affected_pair).copied().unwrap_or(0);
+                    let count = pair_counts.get(&affected_pair).copied().unwrap_or(0).max(0) as u64;
                     if count > 0 {
                         let na = *sym_counts.get(&affected_pair.0).unwrap_or(&0);
                         let nb = *sym_counts.get(&affected_pair.1).unwrap_or(&0);
-                        let score = score_of(self.scoring, na, nb, count as u64, total_tokens);
+                        let score = score_of(self.scoring, na, nb, count, total_tokens);
                         // Re-push with updated score; pos is looked up from pair_to_pos when needed
                         let affected_pos = pair_to_pos.get(&affected_pair).cloned().unwrap_or_default();
                         queue.push(Merge {
                             pair: affected_pair,
-                            count: count as u64,
+                            count,
                             score,
                             pos: affected_pos,
                         });
@@ -839,17 +912,17 @@ impl BpeTrainer {
 
             // Reinsert newly formed/changed pairs with fresh scores
             where_to_update.drain().for_each(|(pair, new_pos)| {
-                let count = pair_counts[&pair];
+                let count = pair_counts.get(&pair).copied().unwrap_or(0).max(0) as u64;
                 if count > 0 {
                     let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
                     let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
-                    let score = score_of(self.scoring, nb, nc, count as u64, total_tokens);
+                    let score = score_of(self.scoring, nb, nc, count, total_tokens);
                     // Update pair_to_pos with the new positions
                     pair_to_pos.entry(pair).or_default().extend(new_pos.iter().cloned());
                     let pos = pair_to_pos.get(&pair).cloned().unwrap_or_default();
                     queue.push(Merge {
                         pair,
-                        count: count as u64,
+                        count,
                         score,
                         pos,
                     });
@@ -884,6 +957,11 @@ impl BpeTrainer {
 
         model.continuing_subword_prefix = self.continuing_subword_prefix.clone();
         model.end_of_word_suffix = self.end_of_word_suffix.clone();
+
+        // Attach telemetry to model if it was collected
+        if let Some(tel) = telemetry {
+            model.telemetry = Some(tel);
+        }
 
         Ok(self.special_tokens.clone())
     }

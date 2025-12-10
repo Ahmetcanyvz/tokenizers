@@ -104,14 +104,19 @@ impl Word {
         });
     }
 
+    /// Merges all non-overlapping occurrences of pair (c1, c2) into replacement.
+    /// Returns (changes, merge_count) where:
+    /// - changes: adjacent pair count changes for updating pair_counts
+    /// - merge_count: actual number of merges performed in this word
     pub(super) fn merge(
         &mut self,
         c1: u32,
         c2: u32,
         replacement: u32,
         max_length: usize,
-    ) -> Vec<(Pair, i32)> {
+    ) -> (Vec<(Pair, i32)>, usize) {
         let mut changes: Vec<(Pair, i32)> = vec![];
+        let mut merge_count: usize = 0;
         let mut i = 0;
         loop {
             if i >= self.symbols.len() {
@@ -151,12 +156,14 @@ impl Word {
                         changes.push(((replacement, self.symbols[i + 1].c), 1));
                     }
                 }
+
+                merge_count += 1;
             }
 
             i += 1;
         }
 
-        changes
+        (changes, merge_count)
     }
     // Heap-based implementation of BPE merges
     pub(super) fn merge_all(&mut self, merges: &AHashMap<Pair, (u32, u32)>, dropout: Option<f32>) {
@@ -285,7 +292,7 @@ mod tests {
 
         // We're going to perform a merge on the pair ('l', 'l') ~= (2, 2). Let's
         // say that 'll' has the ID of 4 in the updated word-to-id vocab.
-        let changes = word.merge(2, 2, 4, usize::MAX);
+        let (changes, merge_count) = word.merge(2, 2, 4, usize::MAX);
 
         // So the word should now look like this:
         assert_eq!(
@@ -297,6 +304,9 @@ mod tests {
                 3u32, // 'o'
             ]
         );
+
+        // One merge was performed
+        assert_eq!(merge_count, 1);
 
         // The return value `changes` will be used to update the pair counts during
         // training. This merge affects the counts for the pairs
@@ -329,7 +339,7 @@ mod tests {
 
         // We're going to perform a merge on the pair ('l', 'l') ~= (2, 2). Let's
         // say that 'll' has the ID of 4 in the updated word-to-id vocab.
-        let changes = word.merge(2, 2, 4, 2);
+        let (changes, merge_count) = word.merge(2, 2, 4, 2);
         assert_eq!(
             word.get_chars(),
             &[
@@ -340,6 +350,9 @@ mod tests {
             ]
         );
 
+        // One merge was performed
+        assert_eq!(merge_count, 1);
+
         assert_eq!(
             changes,
             &[
@@ -347,6 +360,35 @@ mod tests {
                 // ((1u32, 4u32), 1i32),  Missing since this would be larger than 2
                 ((2u32, 3u32), -1i32), // count for ('l', 'o') should be decreased by 1.
                                        // ((4u32, 3u32), 1i32), Missing since this would be larger than 2
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_overlapping_pairs() {
+        // Test that overlapping pairs (like "aaa" with pair (a,a)) are handled correctly
+        // Word "aaa" has pairs (a,a) at positions 0-1 and 1-2, but only one can be merged
+        let mut word = Word::new();
+        word.add(0, 1); // 'a'
+        word.add(0, 1); // 'a'
+        word.add(0, 1); // 'a'
+
+        // Merge (a, a) -> A (id 1)
+        let (changes, merge_count) = word.merge(0, 0, 1, usize::MAX);
+
+        // Result should be "Aa" (length 2), not "A" (length 1)
+        // Only ONE merge should happen due to greedy left-to-right
+        assert_eq!(word.get_chars(), &[1u32, 0u32]); // 'A', 'a'
+        assert_eq!(merge_count, 1);
+
+        // Changes should reflect the merge:
+        // - (a, a) pair at position 1-2 is destroyed: ((0, 0), -1)
+        // - (A, a) pair is created: ((1, 0), 1)
+        assert_eq!(
+            changes,
+            &[
+                ((0u32, 0u32), -1i32), // The second (a, a) pair is destroyed
+                ((1u32, 0u32), 1i32),  // New (A, a) pair is created
             ]
         );
     }

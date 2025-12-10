@@ -37,6 +37,12 @@ pub struct MergeEvent {
     pub score: f64,
     /// Optional exact ΔLL change if tracked (None when not tracking)
     pub delta_ll: Option<f64>,
+    /// Total token count (N) at time of merge (for debugging)
+    pub total_tokens: Option<u64>,
+    /// Symbol count for left symbol (n_a) at time of merge
+    pub n_a: Option<u64>,
+    /// Symbol count for right symbol (n_b) at time of merge
+    pub n_b: Option<u64>,
 }
 
 /// An item inside a snapshot of the selection scores.

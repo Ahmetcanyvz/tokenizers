@@ -461,6 +461,22 @@ impl PyBPE {
                     } else {
                         d.set_item("delta_ll", py.None())?;
                     }
+                    // Add debugging fields for N, n_a, n_b
+                    if let Some(n) = ev.total_tokens {
+                        d.set_item("total_tokens", n)?;
+                    } else {
+                        d.set_item("total_tokens", py.None())?;
+                    }
+                    if let Some(na) = ev.n_a {
+                        d.set_item("n_a", na)?;
+                    } else {
+                        d.set_item("n_a", py.None())?;
+                    }
+                    if let Some(nb) = ev.n_b {
+                        d.set_item("n_b", nb)?;
+                    } else {
+                        d.set_item("n_b", py.None())?;
+                    }
                     // robust conversion across PyO3 versions:
                     mt.push(d.into_any().unbind().into());
                 }
