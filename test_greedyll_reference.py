@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 # ---------- CONFIG ----------
 DATASET_PATH = "/Users/ahmetcanyavuz/Developer/tokenizers/fineweb_data/fineweb_en_sentences.txt"
-NUM_MERGES = 1000  # Number of merges to compare
+NUM_MERGES = 500  # Number of merges to compare
 MIN_FREQ = 2
 MAX_LINES = 100000  # Limit lines for faster testing (None = all)
 # ----------------------------
