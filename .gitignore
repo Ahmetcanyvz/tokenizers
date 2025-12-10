@@ -25,8 +25,8 @@ pip-wheel-metadata
 .vscode
 *.code-workspace
 /fineweb_data/*
-/results_10k/*
-/results_100k/*
+/results_10k_fixed/*
+/results_100k_fixed_heapclean/*
 /results_50k/*
 /old_toks/*
 old_toks/
@@ -37,4 +37,6 @@ results_token_counts/
 *.mp4
 *.png
 *.ipynb_checkpoints/
+*.md
+/.venv/
 
