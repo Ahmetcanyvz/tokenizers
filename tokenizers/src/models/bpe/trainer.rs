@@ -857,7 +857,6 @@ impl BpeTrainer {
 
             // Remove the merged pair from pair_counts entirely (it's been fully consumed)
             pair_counts.remove(&top.pair);
-
             // Update symbol marginals and total token count incrementally
             if applied_bc > 0 {
                 if let Some(v) = sym_counts.get_mut(&top.pair.0) {
@@ -934,6 +933,28 @@ impl BpeTrainer {
 
             if let Some(p) = &progress {
                 p.inc(1);
+            }
+
+            // Periodic heap rebuild to eliminate stale entries
+            // This prevents unbounded heap growth in ΔLL-based scoring modes
+            const REBUILD_INTERVAL: u32 = 50_000;
+            if merge_step % REBUILD_INTERVAL == 0 {
+                // Rebuild heap from scratch using current pair_counts
+                queue = OctonaryHeap::with_capacity(pair_counts.len());
+                for (&pair, &count) in pair_counts.iter() {
+                    if count > 0 {
+                        let nb = *sym_counts.get(&pair.0).unwrap_or(&0);
+                        let nc = *sym_counts.get(&pair.1).unwrap_or(&0);
+                        let score = score_of(self.scoring, nb, nc, count as u64, total_tokens);
+                        let pos = pair_to_pos.get(&pair).cloned().unwrap_or_default();
+                        queue.push(Merge {
+                            pair,
+                            count: count as u64,
+                            score,
+                            pos,
+                        });
+                    }
+                }
             }
         }
         self.finalize_progress(&progress, merges.len());
