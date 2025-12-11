@@ -52,8 +52,8 @@ def train_and_merges(score_by: str, stop_by: str, k: int = 5, tag: str = ""):
 def main():
     runs = [
         ("count",     "vocab_size",      "count"),
-        ("exact_ll",  "delta_ll_exact",  "exact_ll"),
-        ("approx_ll", "delta_ll_approx", "approx_ll"),
+        ("exact_ll",  "vocab_size",  "exact_ll"),
+        ("approx_ll", "vocab_size", "approx_ll"),
     ]
     for score_by, stop_by, tag in runs:
         m, path = train_and_merges(score_by, stop_by, 5, tag)
