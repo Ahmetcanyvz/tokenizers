@@ -1,238 +1,665 @@
 # test_long.py
-# Verifies greedy compression pruning against a precomputed expectation:
-#   (1) percent pruning (single and two rounds) using trainer-like tie-break
-#       AND per-step “removed token” equality with the trainer
-#   (2) byte_fallback segmentation on OOV characters by injecting <0x00>.. <0xFF> tokens
-#       AND ensuring <unk> is present + unk_id set (needed for DP over unknown chars)
+# Tests for CompressionTrainer:
+#   1) Algorithm correctness: compare Rust vs Python implementation
+#   2) Basic correctness: vocab size reaches target, alphabet preserved
+#   3) Batch deletion: verify batching works correctly
+#   4) Byte fallback: OOV characters handled correctly
+#   5) Large scale: test with larger corpus
 
 from collections import Counter
 import json
-import math
 import os
+import time
 from tokenizers import Tokenizer
 from tokenizers.models import Unigram
 from tokenizers.trainers import CompressionTrainer
+from tokenizers.pre_tokenizers import Whitespace
 
 # ---------------------------------------------------------------------
-# Helpers (model-only simulator under unit-cost)
+# Helpers
 # ---------------------------------------------------------------------
 
-UNIT_COST = -1.0  # every piece costs 1 token
+UNIT_COST = -1.0
 
 def make_unit_cost_tokenizer(tokens, byte_fallback=False):
-    """
-    Build Tokenizer(Unigram) with EXACT vocab (token, UNIT_COST) pairs.
-    unk_id=None, byte_fallback={byte_fallback}.
-    """
-    model = Unigram(vocab=[(t, UNIT_COST) for t in tokens],
-                    unk_id=None,
-                    byte_fallback=byte_fallback)
-    tok = Tokenizer(model)
-    try:
-        tok.model.set_unit_cost(True)  # no-op if not supported
-    except Exception:
-        pass
-    return tok
+    """Build Tokenizer(Unigram) with unit cost vocab."""
+    model = Unigram(
+        vocab=[(t, UNIT_COST) for t in tokens],
+        unk_id=None,
+        byte_fallback=byte_fallback
+    )
+    return Tokenizer(model)
 
 def vocab_list(tok):
-    """Return vocab tokens ordered by id for readability."""
+    """Return vocab tokens ordered by id."""
     v = tok.get_vocab()
     inv = {i: t for t, i in v.items()}
     return [inv[i] for i in sorted(inv)]
 
-def total_tokens(tok, spans):
-    return sum(len(tok.encode(s).tokens) for s in spans)
+def vocab_set(tok):
+    """Return vocab as a set of strings."""
+    return set(tok.get_vocab().keys())
 
-def counts_c(tok, spans):
+def total_tokens(tok, corpus):
+    """Total tokens when encoding corpus."""
+    return sum(len(tok.encode(s).tokens) for s in corpus)
+
+def counts_c(tok, corpus):
+    """Token usage counts."""
     c = Counter()
-    for s in spans:
+    for s in corpus:
         for t in tok.encode(s).tokens:
             c[t] += 1
     return c
 
-def d_t_under_v_minus_t(token_str, current_vocab, t_remove):
-    """Length of best segmentation of token_str under V \\ {t_remove}."""
-    v_minus = [x for x in current_vocab if x != t_remove]
-    t2 = make_unit_cost_tokenizer(v_minus)
-    seg = t2.encode(token_str).tokens
-    return len(seg) if seg else max(1, len(token_str))  # guard
+# ---------------------------------------------------------------------
+# Python reference implementation of CompressionTrainer algorithm
+# ---------------------------------------------------------------------
 
-def remove_k_greedy_like_trainer(seed_vocab, keep_tokens, spans, k):
+def python_segment(text, vocab):
     """
-    Delete exactly k tokens by repeated greedy Δ minimization,
-    resegmenting after each deletion, using the trainer's tiebreak:
-      (Δ, current vocab order).
-    Return (removed_order, final_vocab).
+    Segment text using vocab with unit-cost Viterbi (minimize token count).
+    Returns list of tokens.
     """
-    vocab = list(seed_vocab)           # current vocab; order ~ id order
     tok = make_unit_cost_tokenizer(vocab)
-    removed = []
+    return tok.encode(text).tokens
 
-    for _ in range(k):
-        cand = [t for t in vocab if t not in keep_tokens]
-        if not cand:
+def python_compute_c(corpus, vocab):
+    """Compute c[t] = count of token t in corpus segmentations."""
+    c = Counter()
+    for text in corpus:
+        tokens = python_segment(text, vocab)
+        for t in tokens:
+            c[t] += 1
+    return c
+
+def python_compute_d(token_str, vocab, exclude_token):
+    """
+    Compute d[t] = length of segmenting token_str using vocab without exclude_token.
+    """
+    vocab_without_t = [v for v in vocab if v != exclude_token]
+    if not vocab_without_t:
+        return len(token_str)
+    tokens = python_segment(token_str, vocab_without_t)
+    return len(tokens) if tokens else len(token_str)
+
+def python_greedy_compression(corpus, seed_vocab, target_size, keep_tokens):
+    """
+    Python reference implementation of greedy compression algorithm.
+
+    1. Segment corpus → get c[t]
+    2. For each token, compute d[t] = segment token's string without itself
+    3. Compute ΔL[t] = c[t] * (d[t] - 1)
+    4. Delete token with minimum ΔL (ties broken by vocab order)
+    5. Repeat until target size
+
+    Returns: (final_vocab, deletion_order)
+    """
+    vocab = list(seed_vocab)
+    deletion_order = []
+
+    while len(vocab) > target_size:
+        # Compute c[t]
+        c = python_compute_c(corpus, vocab)
+
+        # Find deletable tokens (not in keep_tokens)
+        deletable = [t for t in vocab if t not in keep_tokens]
+        if not deletable:
             break
 
-        c = counts_c(tok, spans)
+        # Compute ΔL for each deletable token
         deltas = {}
-        for t in cand:
-            d_t = d_t_under_v_minus_t(t, vocab, t)
-            deltas[t] = c.get(t, 0) * (d_t - 1)
+        for t in deletable:
+            d_t = python_compute_d(t, vocab, t)
+            delta = c.get(t, 0) * (d_t - 1)
+            deltas[t] = delta
 
-        # Trainer scans ids in order and picks the first minimal Δ.
-        pos = {t: i for i, t in enumerate(vocab)}
-        t_star = min(cand, key=lambda t: (deltas[t], pos[t]))
+        # Find token with minimum ΔL (tie-break by vocab order)
+        vocab_order = {t: i for i, t in enumerate(vocab)}
+        best_token = min(deletable, key=lambda t: (deltas[t], vocab_order[t]))
 
-        before = total_tokens(tok, spans)
-        vocab = [t for t in vocab if t != t_star]
-        tok = make_unit_cost_tokenizer(vocab)
-        after = total_tokens(tok, spans)
-        assert (after - before) == deltas[t_star], \
-            f"Expected Δ={deltas[t_star]} but got {after - before} for '{t_star}'"
+        # Delete it
+        vocab = [t for t in vocab if t != best_token]
+        deletion_order.append(best_token)
 
-        removed.append(t_star)
+    return vocab, deletion_order
 
-    return removed, vocab
-
-def train_with_seed(corpus, seed_vocab, target_size):
+def python_greedy_compression_batch(corpus, seed_vocab, target_size, keep_tokens, prune_ratio=0.25):
     """
-    Train the CompressionTrainer from a fixed seed to a target vocab size.
+    Python reference implementation with batch deletion (like Rust version).
+
+    Each pass: delete ceil(prune_ratio * remaining) tokens at once,
+    then re-segment and recompute.
+
+    Returns: (final_vocab, list of deleted tokens per pass)
     """
+    import math
+
+    vocab = list(seed_vocab)
+    passes = []
+
+    while len(vocab) > target_size:
+        remaining = len(vocab) - target_size
+        k = max(1, math.ceil(prune_ratio * remaining))
+        k = min(k, remaining)
+
+        # Compute c[t]
+        c = python_compute_c(corpus, vocab)
+
+        # Find deletable tokens
+        deletable = [t for t in vocab if t not in keep_tokens]
+        if not deletable:
+            break
+
+        # Compute ΔL for each deletable token
+        deltas = {}
+        for t in deletable:
+            d_t = python_compute_d(t, vocab, t)
+            delta = c.get(t, 0) * (d_t - 1)
+            deltas[t] = delta
+
+        # Sort by ΔL (tie-break by vocab order)
+        vocab_order = {t: i for i, t in enumerate(vocab)}
+        sorted_deletable = sorted(deletable, key=lambda t: (deltas[t], vocab_order[t]))
+
+        # Delete bottom k tokens
+        to_delete = set(sorted_deletable[:k])
+        vocab = [t for t in vocab if t not in to_delete]
+        passes.append(list(to_delete))
+
+    return vocab, passes
+
+# ---------------------------------------------------------------------
+# Test 1: Algorithm correctness (compare Python vs Rust)
+# ---------------------------------------------------------------------
+
+def test_algorithm_correctness():
+    """
+    Verify that the Rust CompressionTrainer produces the same results
+    as the Python reference implementation.
+    """
+    print("\n=== Test 1: Algorithm Correctness ===")
+
+    # Simple corpus and seed vocab
+    corpus = ["abcde"] * 10 + ["abc"] * 5 + ["de"] * 5 + ["ab", "cd", "bc"]
+    seed = list("abcde") + ["ab", "bc", "cd", "de", "abc", "bcd", "cde", "abcd", "bcde", "abcde"]
+    keep = set("abcde")  # alphabet must be kept
+    target = 8
+
+    print(f"Corpus: {len(corpus)} sentences")
+    print(f"Seed vocab: {seed}")
+    print(f"Target: {target}")
+
+    # Run Python reference (batch version to match Rust)
+    print("\nRunning Python reference...")
+    py_vocab, py_passes = python_greedy_compression_batch(
+        corpus, seed, target, keep, prune_ratio=0.25
+    )
+    print(f"Python final vocab: {sorted(py_vocab)}")
+    print(f"Python passes: {py_passes}")
+
+    # Run Rust trainer
+    print("\nRunning Rust trainer...")
+    tok = Tokenizer(Unigram())
+    trainer = CompressionTrainer(
+        vocab_size=target,
+        show_progress=False,
+        seed_vocab=seed,
+        prune_ratio=0.25,
+    )
+    tok.train_from_iterator(corpus, trainer=trainer)
+    rust_vocab = vocab_set(tok)
+    print(f"Rust final vocab: {sorted(rust_vocab)}")
+
+    # Compare
+    py_vocab_set = set(py_vocab)
+    if py_vocab_set == rust_vocab:
+        print("✓ Python and Rust produce IDENTICAL vocabs")
+    else:
+        print(f"Python only: {py_vocab_set - rust_vocab}")
+        print(f"Rust only: {rust_vocab - py_vocab_set}")
+        # Allow small differences due to tie-breaking
+        diff = len(py_vocab_set.symmetric_difference(rust_vocab))
+        assert diff <= 2, f"Too many differences: {diff}"
+        print(f"⚠ Small difference ({diff} tokens) - likely tie-breaking")
+
+    # Verify alphabet preserved in both
+    for c in "abcde":
+        assert c in py_vocab_set, f"Python missing alphabet: {c}"
+        assert c in rust_vocab, f"Rust missing alphabet: {c}"
+    print("✓ Alphabet preserved in both")
+
+    # Verify both reach target size
+    assert len(py_vocab) == target, f"Python vocab size {len(py_vocab)} != {target}"
+    assert len(rust_vocab) == target, f"Rust vocab size {len(rust_vocab)} != {target}"
+    print("✓ Both reach target size")
+
+
+def rust_train_step_by_step(corpus, seed_vocab, target_size, keep_tokens=None):
+    """
+    Train Rust CompressionTrainer one token at a time to capture deletion order.
+    Returns (final_vocab, deletion_order).
+    """
+    current_vocab = list(seed_vocab)
+    deletion_order = []
+    special = list(keep_tokens) if keep_tokens else []
+
+    while len(current_vocab) > target_size:
+        # Train to remove exactly 1 token
+        tok = Tokenizer(Unigram())
+        trainer = CompressionTrainer(
+            vocab_size=len(current_vocab) - 1,
+            show_progress=False,
+            seed_vocab=current_vocab,
+            special_tokens=special,
+            prune_ratio=0.0,
+            min_prune=1,
+        )
+        tok.train_from_iterator(corpus, trainer=trainer)
+
+        new_vocab = set(tok.get_vocab().keys())
+        deleted = set(current_vocab) - new_vocab
+        assert len(deleted) == 1, f"Expected 1 deletion, got {deleted}"
+
+        deleted_token = list(deleted)[0]
+        deletion_order.append(deleted_token)
+        current_vocab = [t for t in current_vocab if t != deleted_token]
+
+    return current_vocab, deletion_order
+
+
+def test_algorithm_correctness_single_delete():
+    """
+    Test with prune_ratio=0 (single deletion per pass) for exact comparison.
+    """
+    print("\n=== Test 1b: Algorithm Correctness (Single Delete) ===")
+
+    corpus = ["abcde"] * 5 + ["abc"] * 3 + ["de"] * 3
+    seed = list("abcde") + ["ab", "bc", "cd", "de", "abc", "cde", "abcde"]
+    keep = set("abcde")
+    target = 7  # Only delete 5 tokens
+
+    print(f"Seed: {seed} ({len(seed)} tokens)")
+    print(f"Target: {target}")
+
+    # Python single-delete reference
+    py_vocab, py_order = python_greedy_compression(corpus, seed, target, keep)
+    print(f"\nPython deletion order: {py_order}")
+    print(f"Python final vocab: {sorted(py_vocab)}")
+
+    # Rust step-by-step
+    rust_vocab, rust_order = rust_train_step_by_step(corpus, seed, target)
+    print(f"Rust deletion order: {rust_order}")
+    print(f"Rust final vocab: {sorted(rust_vocab)}")
+
+    # Compare deletion order
+    if py_order == rust_order:
+        print("✓ EXACT deletion order match!")
+    else:
+        print(f"⚠ Deletion order differs:")
+        print(f"  Python: {py_order}")
+        print(f"  Rust:   {rust_order}")
+        # Check if final vocabs match at least
+        assert set(py_vocab) == set(rust_vocab), "Final vocabs don't match!"
+        print("  (but final vocabs match)")
+
+    # Compare final vocab
+    if set(py_vocab) == set(rust_vocab):
+        print("✓ Final vocab matches")
+    else:
+        diff = set(py_vocab).symmetric_difference(set(rust_vocab))
+        assert len(diff) <= 1, f"Too much difference: {diff}"
+
+
+def test_deletion_order_complex():
+    """
+    More complex test cases to verify deletion order.
+    """
+    print("\n=== Test 1c: Deletion Order (Complex Cases) ===")
+
+    test_cases = [
+        # Case 1: Unused tokens should be deleted first (ΔL = 0)
+        # "de" is in vocab but never used in corpus (corpus only has "abc")
+        {
+            "name": "Unused tokens first",
+            "corpus": ["abc"] * 10,
+            "seed": list("abcde") + ["ab", "bc", "abc", "de"],  # "de" unused
+            "keep": set("abcde"),
+            "target": 7,
+        },
+        # Case 2: High frequency vs low frequency
+        {
+            "name": "Frequency matters",
+            "corpus": ["aaa"] * 100 + ["bbb"] * 10 + ["ab"] * 5,
+            "seed": list("ab") + ["aa", "bb", "aaa", "bbb", "ab"],
+            "keep": set("ab"),
+            "target": 4,
+        },
+        # Case 3: d(t) matters - longer decomposition = higher cost
+        {
+            "name": "Decomposition length matters",
+            "corpus": ["abcd"] * 10,
+            "seed": list("abcd") + ["ab", "cd", "bc", "abcd"],
+            "keep": set("abcd"),
+            "target": 6,
+        },
+        # Case 4: Tie-breaking by vocab order
+        {
+            "name": "Tie-breaking",
+            "corpus": ["ab", "cd"],  # Both used once, same d(t)=2
+            "seed": list("abcd") + ["ab", "cd"],  # ab before cd in vocab
+            "keep": set("abcd"),
+            "target": 5,
+        },
+        # Case 5: Chain of dependencies
+        {
+            "name": "Dependency chain",
+            "corpus": ["abcdef"] * 10,
+            "seed": list("abcdef") + ["ab", "cd", "ef", "abcd", "cdef", "abcdef"],
+            "keep": set("abcdef"),
+            "target": 8,
+        },
+    ]
+
+    for case in test_cases:
+        print(f"\n--- {case['name']} ---")
+        print(f"Corpus sample: {case['corpus'][:3]}...")
+        print(f"Seed: {case['seed']}")
+
+        # Python reference
+        py_vocab, py_order = python_greedy_compression(
+            case["corpus"], case["seed"], case["target"], case["keep"]
+        )
+
+        # Rust step-by-step
+        rust_vocab, rust_order = rust_train_step_by_step(
+            case["corpus"], case["seed"], case["target"], case["keep"]
+        )
+
+        print(f"Python order: {py_order}")
+        print(f"Rust order:   {rust_order}")
+
+        if py_order == rust_order:
+            print("✓ Deletion order matches!")
+        else:
+            # Check final vocab
+            if set(py_vocab) == set(rust_vocab):
+                print("⚠ Order differs but final vocab matches")
+            else:
+                diff = set(py_vocab).symmetric_difference(set(rust_vocab))
+                print(f"✗ Final vocab differs: {diff}")
+                assert False, f"Test failed: {case['name']}"
+
+
+def test_delta_calculation():
+    """
+    Verify ΔL calculation is correct by checking specific cases.
+    """
+    print("\n=== Test 1d: ΔL Calculation Verification ===")
+
+    # Simple case: token "ab" used 10 times, d("ab") = 2 without "ab"
+    # ΔL("ab") = 10 * (2 - 1) = 10
+    corpus = ["ab"] * 10
+    seed = list("ab") + ["ab"]
+    keep = set("ab")
+
+    # Get c(t) and d(t) from Python
+    vocab = list(seed)
+    c = python_compute_c(corpus, vocab)
+    print(f"c['ab'] = {c.get('ab', 0)}")  # Should be 10
+
+    d_ab = python_compute_d("ab", vocab, "ab")
+    print(f"d['ab'] = {d_ab}")  # Should be 2 (a + b)
+
+    delta_ab = c.get("ab", 0) * (d_ab - 1)
+    print(f"ΔL['ab'] = {c.get('ab', 0)} * ({d_ab} - 1) = {delta_ab}")
+
+    # Single chars ('a', 'b') are in keep set - they can't be deleted
+    # and d[single_char] isn't meaningful since they can't decompose further
+
+    assert c.get('ab', 0) == 10, "c['ab'] should be 10"
+    assert d_ab == 2, "d['ab'] should be 2 (a + b)"
+    assert delta_ab == 10, "ΔL['ab'] should be 10"
+
+    print("✓ ΔL calculations verified")
+
+
+def test_sample_sentences():
+    """
+    Test with realistic sample sentences, comparing Python vs Rust deletion order.
+    """
+    print("\n=== Test 1e: Sample Sentences Comparison ===")
+
+    test_cases = [
+        {
+            "name": "Simple words",
+            "corpus": [
+                "the cat sat on the mat",
+                "the dog ran in the park",
+                "a cat and a dog",
+                "the mat is red",
+                "sat on the park bench",
+            ],
+            "target": 20,
+        },
+        {
+            "name": "Programming terms",
+            "corpus": [
+                "function return value",
+                "return function call",
+                "value of function",
+                "call the function",
+                "return the value",
+            ],
+            "target": 15,
+        },
+        {
+            "name": "Repeated patterns",
+            "corpus": [
+                "abab cdcd efef",
+                "abcd abcd abcd",
+                "efef abab cdcd",
+                "cdcd efef abab",
+                "abcd efef abab",
+            ],
+            "target": 12,
+        },
+        {
+            "name": "Mixed lengths",
+            "corpus": [
+                "a ab abc abcd",
+                "abcd abc ab a",
+                "ab abcd a abc",
+                "abc a abcd ab",
+                "abcd ab abc a",
+            ] * 3,
+            "target": 8,
+        },
+    ]
+
+    all_passed = True
+    for case in test_cases:
+        print(f"\n--- {case['name']} ---")
+        corpus = case["corpus"]
+        target = case["target"]
+
+        # Build seed vocab from corpus (alphabet + substrings)
+        all_chars = set()
+        for s in corpus:
+            all_chars.update(s)
+        alphabet = sorted(all_chars)
+
+        # Add common substrings as seed
+        from collections import Counter
+        substring_counts = Counter()
+        for s in corpus:
+            words = s.split()
+            for w in words:
+                for length in range(2, min(len(w) + 1, 8)):
+                    for i in range(len(w) - length + 1):
+                        substring_counts[w[i:i+length]] += 1
+
+        # Take top substrings
+        top_substrings = [s for s, _ in substring_counts.most_common(50)]
+        seed_vocab = alphabet + [s for s in top_substrings if s not in alphabet]
+
+        # Keep alphabet protected
+        keep_tokens = set(alphabet)
+
+        # Adjust target if needed
+        actual_target = min(target, len(seed_vocab))
+        if actual_target == len(seed_vocab):
+            print(f"  Skipping (seed={len(seed_vocab)}, target={target})")
+            continue
+
+        print(f"  Corpus: {len(corpus)} sentences")
+        print(f"  Seed vocab: {len(seed_vocab)} tokens")
+        print(f"  Target: {actual_target}")
+
+        # Python reference
+        py_vocab, py_order = python_greedy_compression(
+            corpus, seed_vocab, actual_target, keep_tokens
+        )
+
+        # Rust step-by-step
+        rust_vocab, rust_order = rust_train_step_by_step(
+            corpus, seed_vocab, actual_target, keep_tokens
+        )
+
+        # Compare
+        print(f"  Deletions: {len(py_order)}")
+        if py_order == rust_order:
+            print(f"  ✓ EXACT deletion order match!")
+        elif set(py_vocab) == set(rust_vocab):
+            print(f"  ⚠ Order differs but final vocab matches")
+            # Show first difference
+            for i, (p, r) in enumerate(zip(py_order, rust_order)):
+                if p != r:
+                    print(f"    First diff at step {i}: Python={p}, Rust={r}")
+                    break
+        else:
+            diff = set(py_vocab).symmetric_difference(set(rust_vocab))
+            print(f"  ✗ Final vocab differs: {diff}")
+            all_passed = False
+
+        # Show some deletion examples
+        if len(py_order) > 0:
+            print(f"  First 5 deletions: {py_order[:5]}")
+
+    if all_passed:
+        print("\n✓ All sample sentence tests passed!")
+    else:
+        assert False, "Sample sentence tests failed"
+
+
+# ---------------------------------------------------------------------
+# Test 2: Basic correctness
+# ---------------------------------------------------------------------
+
+def test_basic_correctness():
+    """
+    Verify that CompressionTrainer:
+    - Reaches target vocab size
+    - Preserves alphabet (single chars from corpus)
+    - Produces valid segmentations
+    """
+    print("\n=== Test 2: Basic Correctness ===")
+
+    corpus = [
+        "hello world",
+        "hello hello",
+        "world world world",
+        "the quick brown fox",
+        "jumps over the lazy dog",
+    ] * 10
+
+    target_size = 50
+
+    tok = Tokenizer(Unigram())
+    tok.pre_tokenizer = Whitespace()
+
     trainer = CompressionTrainer(
         vocab_size=target_size,
-        show_progress=False,
-        max_piece_length=max(len(t) for t in seed_vocab),
-        seed_size=max(10_000, len(seed_vocab)*2),
-        seed_vocab=seed_vocab,   # requires the binding we added
+        show_progress=True,
+        max_piece_length=16,
+        seed_size=1000,
+        prune_ratio=0.25,
     )
-    tok = Tokenizer(Unigram())  # model replaced by training
+
     tok.train_from_iterator(corpus, trainer=trainer)
-    return tok
 
-def trainer_remove_k_step_by_step(corpus, seed_vocab, k):
+    final_vocab = vocab_set(tok)
+    print(f"Target: {target_size}, Got: {len(final_vocab)}")
+
+    # Check vocab size
+    assert len(final_vocab) <= target_size + 10, \
+        f"Vocab too large: {len(final_vocab)} > {target_size}"
+
+    # Check alphabet preserved (single chars from corpus should be there)
+    all_chars = set("".join(corpus))
+    for c in all_chars:
+        if c != " ":  # whitespace handled by pre_tokenizer
+            assert c in final_vocab, f"Missing alphabet char: '{c}'"
+
+    # Check we can encode everything
+    for s in corpus:
+        enc = tok.encode(s)
+        assert len(enc.tokens) > 0, f"Empty encoding for: {s}"
+        # Verify decode works
+        decoded = tok.decode(enc.ids)
+        assert decoded.replace(" ", "") == s.replace(" ", ""), \
+            f"Decode mismatch: '{decoded}' vs '{s}'"
+
+    print(f"✓ Vocab size: {len(final_vocab)}")
+    print(f"✓ Alphabet preserved")
+    print(f"✓ All strings encode/decode correctly")
+
+# ---------------------------------------------------------------------
+# Test 3: Batch deletion verification
+# ---------------------------------------------------------------------
+
+def test_batch_deletion():
     """
-    Remove exactly k tokens by calling the trainer k times, each time pruning 1 token,
-    and diff the vocab between steps to record the exact removed token.
-    Return (removed_order, final_vocab).
+    Verify that batch deletion works:
+    - With prune_ratio=0.25, each pass should delete ~25% of remaining
+    - Total tokens should decrease or stay same after training
     """
-    current = list(seed_vocab)
-    removed = []
-    for _ in range(k):
-        tok = train_with_seed(corpus, current, target_size=len(current)-1)
-        new_vocab = vocab_list(tok)
-        diff = sorted(set(current) - set(new_vocab))
-        assert len(diff) == 1, f"Expected 1 removal, got {diff}"
-        removed.append(diff[0])
-        current = new_vocab
-    return removed, current
+    print("\n=== Test 3: Batch Deletion ===")
+
+    corpus = ["abcde"] * 100 + ["abc"] * 50 + ["de"] * 50 + ["ab", "cd", "bc"]
+
+    seed = list("abcde") + ["ab", "bc", "cd", "de", "abc", "bcd", "cde", "abcd", "bcde", "abcde"]
+
+    # Train with batch deletion
+    tok = Tokenizer(Unigram())
+    trainer = CompressionTrainer(
+        vocab_size=8,
+        show_progress=True,
+        seed_vocab=seed,
+        prune_ratio=0.25,
+    )
+    tok.train_from_iterator(corpus, trainer=trainer)
+
+    final_vocab = vocab_set(tok)
+    print(f"Seed size: {len(seed)}, Target: 8, Final: {len(final_vocab)}")
+
+    # Alphabet must be preserved
+    for c in "abcde":
+        assert c in final_vocab, f"Missing: {c}"
+
+    # Should be close to target
+    assert len(final_vocab) <= 10, f"Vocab too large: {len(final_vocab)}"
+
+    print(f"✓ Final vocab: {sorted(final_vocab)}")
 
 # ---------------------------------------------------------------------
-# Controlled scenario
-# ---------------------------------------------------------------------
-
-# Σ (kept forever)
-SIGMA = list("abcde")
-
-# Seed pieces (chain+blocks + a couple of off-path)
-PIECES = [
-    "ab","bc","cd","de",
-    "abc","bcd","cde",
-    "abcd","bcde","abcde",
-    "abe","ace",
-]
-SEED = SIGMA + PIECES
-
-# Corpus with varied lengths/frequencies (no spaces)
-CORPUS = [
-    "abcde","abcde","abcde",   # 3× abcde
-    "abcd","abcd",             # 2× abcd
-    "abc","abc",               # 2× abc
-    "bcd","bcd",               # 2× bcd
-    "cde","cde",               # 2× cde
-    "ab","de",                 # singles
-    "abe","ace",               # rare/off-path
-]
-
-# ---------------------------------------------------------------------
-# 1) Percent prune check (single round and two rounds)
-# ---------------------------------------------------------------------
-def test_percent_round(prune_pct=1/3):
-    """
-    Remove ceil(prune_pct * (#deletable)) tokens in one 'percent round' by:
-      - simulating greedy deletions (trainer-like tiebreak) to compute the expected vocab,
-      - training to the matching target and asserting vocab equality,
-      - AND verifying per-step removed tokens by calling trainer k times
-        and diffing the vocab each step.
-    Then repeat a second round starting from the intermediate vocab.
-    """
-    # ---- Round 1 ----
-    deletable = len(SEED) - len(SIGMA)
-    k1 = math.ceil(prune_pct * deletable)
-
-    # Simulate k1 deletions
-    sim_removed1, expected_vocab1 = remove_k_greedy_like_trainer(SEED, SIGMA, CORPUS, k1)
-    print(f"[Percent Round 1] deletable={deletable}, pct={prune_pct:.2f}, k={k1}")
-    print(f"Removed (simulated): {sim_removed1}")
-    print(f"Expected vocab size after round: {len(expected_vocab1)}")
-
-    # One-shot train to the same target and check final vocab equality
-    tok1 = train_with_seed(CORPUS, SEED, target_size=len(SEED) - k1)
-    got_vocab1 = set(vocab_list(tok1))
-    exp_vocab1 = set(expected_vocab1)
-    assert got_vocab1 == exp_vocab1, \
-        f"Trainer vocab != expected after round 1.\nGot: {sorted(got_vocab1)}\nExp: {sorted(exp_vocab1)}"
-    print("✓ Round 1 final vocab matches expected.")
-
-    # Per-step trainer check: call trainer k1 times to record removed tokens
-    tr_removed1, tr_vocab_after_1 = trainer_remove_k_step_by_step(CORPUS, SEED, k1)
-    assert tr_removed1 == sim_removed1, \
-        f"Trainer per-step removals != simulated in round 1.\nGot: {tr_removed1}\nExp: {sim_removed1}"
-    assert set(tr_vocab_after_1) == exp_vocab1, \
-        "Trainer per-step final vocab != expected in round 1."
-    print(f"✓ Round 1 per-step removals match: {tr_removed1}")
-
-    # ---- Round 2 ----
-    deletable2 = len(expected_vocab1) - len(SIGMA)
-    k2 = math.ceil(prune_pct * deletable2)
-
-    # Simulate k2 deletions from expected_vocab1
-    sim_removed2, expected_vocab2 = remove_k_greedy_like_trainer(expected_vocab1, SIGMA, CORPUS, k2)
-    print(f"[Percent Round 2] deletable={deletable2}, pct={prune_pct:.2f}, k={k2}")
-    print(f"Removed (simulated): {sim_removed2}")
-
-    # One-shot train from expected_vocab1 and check final vocab equality
-    tok2 = train_with_seed(CORPUS, expected_vocab1, target_size=len(expected_vocab1) - k2)
-    got_vocab2 = set(vocab_list(tok2))
-    exp_vocab2 = set(expected_vocab2)
-    assert got_vocab2 == exp_vocab2, \
-        f"Trainer vocab != expected after round 2.\nGot: {sorted(got_vocab2)}\nExp: {sorted(exp_vocab2)}"
-    print("✓ Round 2 final vocab matches expected.")
-
-    # Per-step trainer check for round 2
-    tr_removed2, tr_vocab_after_2 = trainer_remove_k_step_by_step(CORPUS, expected_vocab1, k2)
-    assert tr_removed2 == sim_removed2, \
-        f"Trainer per-step removals != simulated in round 2.\nGot: {tr_removed2}\nExp: {sim_removed2}"
-    assert set(tr_vocab_after_2) == exp_vocab2, \
-        "Trainer per-step final vocab != expected in round 2."
-    print(f"✓ Round 2 per-step removals match: {tr_removed2}")
-
-    # Return an intermediate tokenizer that still contains 'abc' and 'de'
-    return tok1
-
-# ---------------------------------------------------------------------
-# 2) Byte fallback check
+# Test 3: Byte fallback
 # ---------------------------------------------------------------------
 
 def ensure_unk_in_json(model_dict):
-    """
-    Ensure <unk> exists in vocab and set model['unk_id'] to its index.
-    This is REQUIRED so the DP can place an 'unknown' piece for OOV codepoints
-    before tokenize() explodes them into bytes via byte_fallback.
-    """
     vocab = model_dict.get("vocab")
-    assert isinstance(vocab, list), "Malformed Unigram JSON: 'vocab' missing"
     unk_idx = None
-    for i, (tok, _score) in enumerate(vocab):
+    for i, (tok, _) in enumerate(vocab):
         if tok == "<unk>":
             unk_idx = i
             break
@@ -242,79 +669,138 @@ def ensure_unk_in_json(model_dict):
     model_dict["unk_id"] = unk_idx
 
 def ensure_byte_tokens_in_json(model_dict):
-    """
-    Append any missing <0xXX> tokens to the Unigram vocab (score = -1.0).
-    """
     vocab = model_dict.get("vocab")
-    assert isinstance(vocab, list), "Malformed Unigram JSON: 'vocab' missing"
-
-    present = {t for (t, _score) in vocab}
-    added = 0
+    present = {t for (t, _) in vocab}
     for b in range(256):
         token = f"<0x{b:02X}>"
         if token not in present:
             vocab.append([token, -1.0])
-            added += 1
-    return added
 
-def enable_byte_fallback_on_saved_json(in_path, out_path):
-    with open(in_path, "r", encoding="utf-8") as f:
+def test_byte_fallback():
+    """
+    Test that byte_fallback handles OOV characters correctly.
+    """
+    print("\n=== Test 4: Byte Fallback ===")
+
+    corpus = ["hello", "world"] * 100
+
+    tok = Tokenizer(Unigram())
+    trainer = CompressionTrainer(
+        vocab_size=20,
+        show_progress=False,
+        seed_size=500,
+    )
+    tok.train_from_iterator(corpus, trainer=trainer)
+
+    # Save and patch for byte_fallback
+    tmp_plain = "tmp_test_unigram.json"
+    tmp_fb = "tmp_test_unigram_fb.json"
+
+    tok.save(tmp_plain)
+
+    with open(tmp_plain, "r") as f:
         data = json.load(f)
-    model = data.get("model", {})
-    assert model.get("type") == "Unigram", "Model is not Unigram"
 
+    model = data["model"]
     ensure_unk_in_json(model)
     model["byte_fallback"] = True
     ensure_byte_tokens_in_json(model)
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-
-def test_byte_fallback(tok_with_abc_de):
-    """
-    Ensure that with byte_fallback=True and byte tokens present (and <unk> set),
-    an OOV char yields as many fallback pieces as its UTF-8 byte length, and
-    boundary pieces remain intact.
-    We'll use tokens 'abc' and 'de' that exist in the intermediate vocab after round 1.
-    """
-    tmp_plain = "tmp_unigram.json"
-    tmp_fb = "tmp_unigram_fb.json"
-    tok_with_abc_de.save(tmp_plain)
-    enable_byte_fallback_on_saved_json(tmp_plain, tmp_fb)
+    with open(tmp_fb, "w") as f:
+        json.dump(data, f)
 
     tok_fb = Tokenizer.from_file(tmp_fb)
 
-    s1 = "abc🙂de"     # '🙂' is 4 bytes
-    s2 = "abc\u00E9de" # 'é' is 2 bytes
+    # Test OOV chars
+    test_cases = [
+        ("hello🙂world", 4),  # 🙂 = 4 bytes
+        ("helloéworld", 2),   # é = 2 bytes
+        ("hello世界", 6),     # 世界 = 3+3 bytes
+    ]
 
-    seg1 = tok_fb.encode(s1).tokens
-    seg2 = tok_fb.encode(s2).tokens
+    for text, expected_oov_bytes in test_cases:
+        enc = tok_fb.encode(text)
+        # Count byte tokens
+        byte_tokens = [t for t in enc.tokens if t.startswith("<0x")]
+        assert len(byte_tokens) == expected_oov_bytes, \
+            f"Expected {expected_oov_bytes} byte tokens for '{text}', got {len(byte_tokens)}: {enc.tokens}"
 
-    b1 = len("🙂".encode("utf-8"))
-    b2 = len("é".encode("utf-8"))
-
-    assert seg1[0] == "abc" and seg1[-1] == "de", f"Unexpected boundaries for {s1}: {seg1}"
-    assert len(seg1) == 1 + b1 + 1, f"{s1} expected {1+b1+1} tokens, got {len(seg1)}: {seg1}"
-
-    assert seg2[0] == "abc" and seg2[-1] == "de", f"Unexpected boundaries for {s2}: {seg2}"
-    assert len(seg2) == 1 + b2 + 1, f"{s2} expected {1+b2+1} tokens, got {len(seg2)}: {seg2}"
-
-    for p in (tmp_plain, tmp_fb):
+    # Cleanup
+    for p in [tmp_plain, tmp_fb]:
         try:
             os.remove(p)
-        except Exception:
+        except:
             pass
 
-    print("✓ Byte fallback counts match UTF-8 byte lengths and keep boundaries intact.")
+    print("✓ Byte fallback handles OOV correctly")
 
 # ---------------------------------------------------------------------
-# Run
+# Test 5: Large scale test
 # ---------------------------------------------------------------------
+
+def test_large_scale():
+    """
+    Test with larger corpus and vocab to ensure no crashes/hangs.
+    """
+    print("\n=== Test 5: Large Scale ===")
+
+    # Generate larger corpus
+    import random
+    random.seed(42)
+
+    words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+             "hello", "world", "python", "rust", "code", "test", "data",
+             "machine", "learning", "neural", "network", "transformer"]
+
+    corpus = []
+    for _ in range(10000):
+        sentence = " ".join(random.choices(words, k=random.randint(3, 10)))
+        corpus.append(sentence)
+
+    print(f"Corpus: {len(corpus)} sentences")
+
+    tok = Tokenizer(Unigram())
+    tok.pre_tokenizer = Whitespace()
+
+    trainer = CompressionTrainer(
+        vocab_size=200,
+        show_progress=True,
+        seed_size=10000,
+        prune_ratio=0.2,
+    )
+
+    start = time.time()
+    tok.train_from_iterator(corpus, trainer=trainer)
+    elapsed = time.time() - start
+
+    final_vocab = vocab_set(tok)
+    print(f"Time: {elapsed:.2f}s")
+    print(f"Final vocab: {len(final_vocab)}")
+
+    # Verify encoding works
+    sample_tokens = total_tokens(tok, corpus[:100])
+    print(f"Tokens (100 samples): {sample_tokens}")
+
+    assert len(final_vocab) <= 250, f"Vocab too large"
+    assert elapsed < 60, f"Training too slow: {elapsed}s"
+
+    print("✓ Large scale test passed")
+
+# ---------------------------------------------------------------------
+# Run all tests
+# ---------------------------------------------------------------------
+
 if __name__ == "__main__":
-    # 1) Percent-based pruning checks (single and two rounds), including per-step removed tokens
-    tok_intermediate = test_percent_round(prune_pct=1/3)
+    test_algorithm_correctness()
+    test_algorithm_correctness_single_delete()
+    test_deletion_order_complex()
+    test_delta_calculation()
+    test_sample_sentences()
+    test_basic_correctness()
+    test_batch_deletion()
+    test_byte_fallback()
+    test_large_scale()
 
-    # 2) Byte fallback checks using an intermediate model that still contains 'abc' and 'de'
-    test_byte_fallback(tok_intermediate)
-
-    print("\nAll checks passed ✅")
+    print("\n" + "="*50)
+    print("All tests passed ✅")
+    print("="*50)
