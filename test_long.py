@@ -169,6 +169,136 @@ def python_greedy_compression_batch(corpus, seed_vocab, target_size, keep_tokens
 
     return vocab, passes
 
+
+def python_rand_compression(corpus, seed_vocab, target_size, keep_tokens, sample_size=100):
+    """
+    Python reference implementation of rand_compression algorithm.
+
+    Instead of computing d[t] from token string, we sample spans that use t
+    and measure actual cost difference when resegmenting without t.
+
+    1. Segment corpus → get c[t] and track which spans use each token
+    2. For each token t with c[t] > 0:
+       - Sample up to sample_size spans that use t
+       - Resegment each span without t
+       - Compute avg_extra = average extra tokens
+    3. ΔL[t] = avg_extra × c[t]
+    4. Delete token with minimum ΔL
+    5. Repeat until target size
+
+    Returns: (final_vocab, deletion_order)
+    """
+    vocab = list(seed_vocab)
+    deletion_order = []
+
+    while len(vocab) > target_size:
+        # Segment corpus and build reverse index
+        c = Counter()  # token -> count
+        reverse_index = {}  # token -> list of (span_idx, count_in_span)
+        segmentations = []  # span_idx -> (tokens, span_count)
+
+        for span_idx, text in enumerate(corpus):
+            tokens = python_segment(text, vocab)
+            segmentations.append(tokens)
+
+            # Count tokens in this span
+            local_counts = Counter(tokens)
+            for token, cnt in local_counts.items():
+                c[token] += cnt
+                if token not in reverse_index:
+                    reverse_index[token] = []
+                reverse_index[token].append((span_idx, cnt))
+
+        # Find deletable tokens
+        deletable = [t for t in vocab if t not in keep_tokens]
+        if not deletable:
+            break
+
+        # Compute ΔL for each deletable token using sampling
+        deltas = {}
+        for t in deletable:
+            if c.get(t, 0) == 0:
+                # Token not used - ΔL = 0
+                deltas[t] = 0.0
+                continue
+
+            spans_using_t = reverse_index.get(t, [])
+            if not spans_using_t:
+                deltas[t] = 0.0
+                continue
+
+            # Sample spans
+            sample_count = min(len(spans_using_t), sample_size)
+            total_extra = 0.0
+            total_weight = 0.0
+
+            vocab_without_t = [v for v in vocab if v != t]
+
+            for span_idx, weight in spans_using_t[:sample_count]:
+                old_tokens = segmentations[span_idx]
+                old_len = len(old_tokens)
+
+                # Resegment without token t
+                span_text = corpus[span_idx]
+                new_tokens = python_segment(span_text, vocab_without_t)
+                new_len = len(new_tokens)
+
+                extra = new_len - old_len
+                total_extra += extra * weight
+                total_weight += weight
+
+            # Average extra cost per usage
+            avg_extra = total_extra / total_weight if total_weight > 0 else 0.0
+
+            # ΔL[t] = avg_extra × c[t]
+            deltas[t] = avg_extra * c.get(t, 0)
+
+        # Find token with minimum ΔL (tie-break by vocab order)
+        vocab_order = {t: i for i, t in enumerate(vocab)}
+        best_token = min(deletable, key=lambda t: (deltas[t], vocab_order[t]))
+
+        # Delete it
+        vocab = [t for t in vocab if t != best_token]
+        deletion_order.append(best_token)
+
+    return vocab, deletion_order
+
+
+def rust_train_rand_compression(corpus, seed_vocab, target_size, keep_tokens=None, sample_size=100):
+    """
+    Train Rust CompressionTrainer with rand_scoring=True, one token at a time.
+    Returns (final_vocab, deletion_order).
+    """
+    current_vocab = list(seed_vocab)
+    deletion_order = []
+    special = list(keep_tokens) if keep_tokens else []
+
+    while len(current_vocab) > target_size:
+        # Train to remove exactly 1 token
+        tok = Tokenizer(Unigram())
+        trainer = CompressionTrainer(
+            vocab_size=len(current_vocab) - 1,
+            show_progress=False,
+            seed_vocab=current_vocab,
+            special_tokens=special,
+            rand_scoring=True,
+            rand_sample_size=sample_size,
+            prune_ratio=0.0,
+            min_prune=1,
+        )
+        tok.train_from_iterator(corpus, trainer=trainer)
+
+        new_vocab = set(tok.get_vocab().keys())
+        deleted = set(current_vocab) - new_vocab
+        assert len(deleted) == 1, f"Expected 1 deletion, got {deleted}"
+
+        deleted_token = list(deleted)[0]
+        deletion_order.append(deleted_token)
+        current_vocab = [t for t in current_vocab if t != deleted_token]
+
+    return current_vocab, deletion_order
+
+
 # ---------------------------------------------------------------------
 # Test 1: Algorithm correctness (compare Python vs Rust)
 # ---------------------------------------------------------------------
@@ -288,7 +418,7 @@ def test_algorithm_correctness_single_delete():
     print(f"Python final vocab: {sorted(py_vocab)}")
 
     # Rust step-by-step
-    rust_vocab, rust_order = rust_train_step_by_step(corpus, seed, target)
+    rust_vocab, rust_order = rust_train_step_by_step(corpus, seed, target, keep)
     print(f"Rust deletion order: {rust_order}")
     print(f"Rust final vocab: {sorted(rust_vocab)}")
 
@@ -490,7 +620,6 @@ def test_sample_sentences():
         alphabet = sorted(all_chars)
 
         # Add common substrings as seed
-        from collections import Counter
         substring_counts = Counter()
         for s in corpus:
             words = s.split()
@@ -550,6 +679,132 @@ def test_sample_sentences():
         print("\n✓ All sample sentence tests passed!")
     else:
         assert False, "Sample sentence tests failed"
+
+
+def test_rand_compression():
+    """
+    Test rand_compression algorithm: compare Python vs Rust implementation.
+    """
+    print("\n=== Test 1f: Rand Compression Algorithm ===")
+
+    test_cases = [
+        {
+            "name": "Simple case",
+            "corpus": ["abcde"] * 5 + ["abc"] * 3 + ["de"] * 2,
+            "seed": list("abcde") + ["ab", "bc", "cd", "de", "abc", "cde", "abcde"],
+            "keep": set("abcde"),
+            "target": 7,
+        },
+        {
+            "name": "Overlapping tokens",
+            "corpus": ["abab"] * 5 + ["baba"] * 5,
+            "seed": list("ab") + ["ab", "ba", "aba", "bab", "abab", "baba"],
+            "keep": set("ab"),
+            "target": 5,
+        },
+        {
+            "name": "Frequency difference",
+            "corpus": ["aaa"] * 10 + ["bbb"] * 2,
+            "seed": list("ab") + ["aa", "bb", "aaa", "bbb"],
+            "keep": set("ab"),
+            "target": 4,
+        },
+    ]
+
+    all_passed = True
+    for case in test_cases:
+        print(f"\n--- {case['name']} ---")
+        corpus = case["corpus"]
+        seed = case["seed"]
+        keep = case["keep"]
+        target = case["target"]
+
+        print(f"  Corpus: {len(corpus)} sentences")
+        print(f"  Seed vocab: {len(seed)} tokens")
+        print(f"  Target: {target}")
+
+        # Python rand_compression reference
+        py_vocab, py_order = python_rand_compression(
+            corpus, seed, target, keep, sample_size=100
+        )
+
+        # Rust rand_compression
+        rust_vocab, rust_order = rust_train_rand_compression(
+            corpus, seed, target, keep, sample_size=100
+        )
+
+        print(f"  Python order: {py_order}")
+        print(f"  Rust order:   {rust_order}")
+
+        if py_order == rust_order:
+            print("  ✓ EXACT deletion order match!")
+        elif set(py_vocab) == set(rust_vocab):
+            print("  ⚠ Order differs but final vocab matches")
+            for i, (p, r) in enumerate(zip(py_order, rust_order)):
+                if p != r:
+                    print(f"    First diff at step {i}: Python={p}, Rust={r}")
+                    break
+        else:
+            diff = set(py_vocab).symmetric_difference(set(rust_vocab))
+            print(f"  ✗ Final vocab differs: {diff}")
+            all_passed = False
+
+    if all_passed:
+        print("\n✓ All rand_compression tests passed!")
+    else:
+        assert False, "Rand compression tests failed"
+
+
+def test_rand_vs_original():
+    """
+    Compare rand_compression vs original compression on same data.
+    Both should produce valid results but may differ in token selection.
+    """
+    print("\n=== Test 1g: Rand vs Original Compression ===")
+
+    corpus = ["hello world"] * 10 + ["hello there"] * 5 + ["world here"] * 5
+    seed = list("abcdefghilnortw ") + [
+        "he", "ll", "lo", "wo", "rl", "ld", "th", "er", "re",
+        "hel", "llo", "wor", "rld", "the", "her", "ere",
+        "hell", "ello", "worl", "orld", "ther", "here",
+        "hello", "world", "there",
+    ]
+    keep = set("abcdefghilnortwh ")
+    target = 22
+
+    print(f"Corpus: {len(corpus)} sentences")
+    print(f"Seed: {len(seed)} tokens, Target: {target}")
+
+    # Original compression (Python reference)
+    orig_vocab, orig_order = python_greedy_compression(corpus, seed, target, keep)
+
+    # Rand compression (Python reference)
+    rand_vocab, rand_order = python_rand_compression(corpus, seed, target, keep, sample_size=100)
+
+    print(f"\nOriginal method deleted: {orig_order[:10]}...")
+    print(f"Rand method deleted:     {rand_order[:10]}...")
+
+    print(f"\nOriginal final vocab: {len(orig_vocab)} tokens")
+    print(f"Rand final vocab:     {len(rand_vocab)} tokens")
+
+    # Both should reach target and preserve alphabet
+    assert len(orig_vocab) == target, f"Original didn't reach target: {len(orig_vocab)}"
+    assert len(rand_vocab) == target, f"Rand didn't reach target: {len(rand_vocab)}"
+
+    for c in keep:
+        assert c in orig_vocab, f"Original missing alphabet: {c}"
+        assert c in rand_vocab, f"Rand missing alphabet: {c}"
+
+    # Show difference
+    common = set(orig_vocab) & set(rand_vocab)
+    only_orig = set(orig_vocab) - set(rand_vocab)
+    only_rand = set(rand_vocab) - set(orig_vocab)
+
+    print(f"\nCommon tokens: {len(common)}")
+    print(f"Only in original: {only_orig}")
+    print(f"Only in rand: {only_rand}")
+
+    print("✓ Both methods produce valid vocabularies")
 
 
 # ---------------------------------------------------------------------
@@ -653,7 +908,7 @@ def test_batch_deletion():
     print(f"✓ Final vocab: {sorted(final_vocab)}")
 
 # ---------------------------------------------------------------------
-# Test 3: Byte fallback
+# Test 4: Byte fallback
 # ---------------------------------------------------------------------
 
 def ensure_unk_in_json(model_dict):
@@ -729,7 +984,7 @@ def test_byte_fallback():
     for p in [tmp_plain, tmp_fb]:
         try:
             os.remove(p)
-        except:
+        except Exception:
             pass
 
     print("✓ Byte fallback handles OOV correctly")
@@ -796,6 +1051,8 @@ if __name__ == "__main__":
     test_deletion_order_complex()
     test_delta_calculation()
     test_sample_sentences()
+    test_rand_compression()
+    test_rand_vs_original()
     test_basic_correctness()
     test_batch_deletion()
     test_byte_fallback()
