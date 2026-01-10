@@ -924,6 +924,16 @@ impl PyUnigramTrainer {
 ///         If True, enable Unigram byte fallback in produced model.
 ///     keep_byte_fallback (:obj:`bool`, optional):
 ///         If True (default), treat fallback tokens (if any) as non-deletable.
+///     rand_scoring (:obj:`bool`, optional):
+///         If True, use random sampling to estimate token removal cost (rand_compression method).
+///     rand_sample_size (:obj:`int`, optional):
+///         Number of spans to sample per token for rand_scoring (default 100).
+///     use_expected_counts (:obj:`bool`, optional):
+///         If True, use forward-backward expected counts instead of Viterbi hard counts.
+///         This considers all possible segmentations weighted by their length.
+///     temperature (:obj:`float`, optional):
+///         Temperature for expected counts (default 1.0). Controls sharpness of length preference.
+///         T→0: approaches Viterbi, T=1: standard expected counts, T→∞: uniform weighting.
 #[pyclass(extends=PyTrainer, module = "tokenizers.trainers", name = "CompressionTrainer")]
 pub struct PyCompressionTrainer {}
 
@@ -1086,11 +1096,51 @@ impl PyCompressionTrainer {
         setter!(self_, CompressionTrainer, seed_vocab, sv);
     }
 
+    #[getter]
+    fn get_rand_scoring(self_: PyRef<Self>) -> bool {
+        getter!(self_, CompressionTrainer, rand_scoring)
+    }
+
+    #[setter]
+    fn set_rand_scoring(self_: PyRef<Self>, v: bool) {
+        setter!(self_, CompressionTrainer, rand_scoring, v);
+    }
+
+    #[getter]
+    fn get_rand_sample_size(self_: PyRef<Self>) -> usize {
+        getter!(self_, CompressionTrainer, rand_sample_size)
+    }
+
+    #[setter]
+    fn set_rand_sample_size(self_: PyRef<Self>, v: usize) {
+        setter!(self_, CompressionTrainer, rand_sample_size, v);
+    }
+
+    #[getter]
+    fn get_use_expected_counts(self_: PyRef<Self>) -> bool {
+        getter!(self_, CompressionTrainer, use_expected_counts)
+    }
+
+    #[setter]
+    fn set_use_expected_counts(self_: PyRef<Self>, v: bool) {
+        setter!(self_, CompressionTrainer, use_expected_counts, v);
+    }
+
+    #[getter]
+    fn get_temperature(self_: PyRef<Self>) -> f64 {
+        getter!(self_, CompressionTrainer, temperature)
+    }
+
+    #[setter]
+    fn set_temperature(self_: PyRef<Self>, v: f64) {
+        setter!(self_, CompressionTrainer, temperature, v);
+    }
+
     // ---- Python constructor ----
     #[new]
     #[pyo3(
         signature = (**kwargs),
-        text_signature = "(self, vocab_size=8000, show_progress=True, special_tokens=[], initial_alphabet=[], max_piece_length=16, seed_size=1000000, seed_vocab=None, prune_ratio=0.0, min_prune=1, batch_recompute=True, byte_fallback=False, keep_byte_fallback=True)"
+        text_signature = "(self, vocab_size=8000, show_progress=True, special_tokens=[], initial_alphabet=[], max_piece_length=16, seed_size=1000000, seed_vocab=None, prune_ratio=0.0, min_prune=1, batch_recompute=True, byte_fallback=False, keep_byte_fallback=True, rand_scoring=False, rand_sample_size=100, use_expected_counts=False, temperature=1.0)"
     )]
     pub fn new(kwargs: Option<Bound<'_, PyDict>>) -> PyResult<(Self, PyTrainer)> {
         let mut builder = tk::models::unigram::CompressionTrainer::builder();
@@ -1125,6 +1175,18 @@ impl PyCompressionTrainer {
                     }
                     "keep_byte_fallback" => {
                         builder.keep_byte_fallback(val.extract()?);
+                    }
+                    "rand_scoring" => {
+                        builder.rand_scoring(val.extract()?);
+                    }
+                    "rand_sample_size" => {
+                        builder.rand_sample_size(val.extract()?);
+                    }
+                    "use_expected_counts" => {
+                        builder.use_expected_counts(val.extract()?);
+                    }
+                    "temperature" => {
+                        builder.temperature(val.extract()?);
                     }
                     "initial_alphabet" => {
                         let alphabet: Vec<String> = val.extract()?;

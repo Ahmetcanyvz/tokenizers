@@ -31,6 +31,7 @@ pub struct Unigram {
     byte_fallback: bool,                    // allow <0xNN> fallback per byte
     // ----------------- NEW -----------------
     unit_cost: bool,                        // if true, every token has score -1 (minimize #tokens)
+    temperature: f64,                       // temperature for unit_cost mode (score = -1/T)
     // --------------------------------------
 }
 
@@ -58,7 +59,8 @@ impl Clone for Unigram {
             fuse_unk: self.fuse_unk,
             is_optimized: self.is_optimized,
             byte_fallback: self.byte_fallback,
-            unit_cost: self.unit_cost, // keep same mode flag
+            unit_cost: self.unit_cost,
+            temperature: self.temperature,
         }
     }
 }
@@ -69,7 +71,8 @@ impl std::fmt::Debug for Unigram {
             .field("vocab", &self.vocab.len())
             .field("unk_id", &self.unk_id)
             .field("byte_fallback", &self.byte_fallback)
-            .field("unit_cost", &self.unit_cost) // show mode to aid debugging
+            .field("unit_cost", &self.unit_cost)
+            .field("temperature", &self.temperature)
             .finish()
     }
 }
@@ -145,7 +148,8 @@ impl Unigram {
             cache: Cache::default(),
             is_optimized,
             byte_fallback,
-            unit_cost: false, // NEW: default to normal unigram scoring; trainers can enable
+            unit_cost: false,
+            temperature: 1.0, // default temperature (no scaling)
         })
     }
 
@@ -160,6 +164,23 @@ impl Unigram {
     pub fn set_unit_cost(&mut self, unit_cost: bool) {
         if self.unit_cost != unit_cost {
             self.unit_cost = unit_cost;
+            self.cache = self.cache.fresh();
+        }
+    }
+
+    /// Returns the current temperature for unit-cost mode.
+    pub fn temperature(&self) -> f64 {
+        self.temperature
+    }
+
+    /// Sets temperature for unit-cost mode. Clears cache if temperature changes.
+    /// In unit-cost mode, token score = -1.0 / temperature.
+    /// - T → 0: Approaches hard Viterbi (only shortest path matters)
+    /// - T = 1: Standard unit-cost (score = -1.0)
+    /// - T → ∞: Uniform weighting across all paths
+    pub fn set_temperature(&mut self, temperature: f64) {
+        if (self.temperature - temperature).abs() > 1e-9 {
+            self.temperature = temperature;
             self.cache = self.cache.fresh();
         }
     }
@@ -212,8 +233,12 @@ impl Unigram {
                 let item = &self.vocab[id];
                 assert_eq!(item.0, tok);
 
-                // NEW: if unit_cost, override score with -1.0, else use stored log-score
-                let score: f64 = if self.unit_cost { -1.0 } else { item.1 };
+                // NEW: if unit_cost, use -1.0/temperature; else use stored log-score
+                let score: f64 = if self.unit_cost {
+                    -1.0 / self.temperature
+                } else {
+                    item.1
+                };
 
                 lattice.insert(begin_pos, n, score, id);
                 if !has_single_node && n == mblen {
@@ -270,8 +295,12 @@ impl Unigram {
                 let item = &self.vocab[id];
                 debug_assert_eq!(item.0, tok);
 
-                // Unit-cost override if enabled
-                let score: f64 = if self.unit_cost { -1.0 } else { item.1 };
+                // Unit-cost override if enabled (with temperature)
+                let score: f64 = if self.unit_cost {
+                    -1.0 / self.temperature
+                } else {
+                    item.1
+                };
 
                 lattice.insert(begin_pos, n, score, id);
                 if !has_single_node && n == mblen {
@@ -369,9 +398,13 @@ impl Unigram {
                 let target_node = &mut best_path_ends_at[key_pos];
                 let length = key_pos - starts_at;
                 let id = self.token_to_ids.get(&token).unwrap();
-                // NEW: override score with -1 in unit-cost mode
+                // NEW: override score with -1/T in unit-cost mode
                 let base = self.vocab.get(*id as usize).unwrap().1;
-                let score = if self.unit_cost { -1.0 } else { base };
+                let score = if self.unit_cost {
+                    -1.0 / self.temperature
+                } else {
+                    base
+                };
 
                 let candidate_best_path_score = score + best_path_score_till_here;
                 if target_node.starts_at.is_none()
