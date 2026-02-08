@@ -227,7 +227,14 @@ impl CompressionTrainer {
         let suffix = esaxx_rs::suffix_rs(&flat).expect("esaxx_rs suffix_rs failed");
 
         // 1) Single characters, sorted by decreasing frequency
+        //    Also include initial_alphabet chars (with freq 0 if not in corpus)
         let mut seed: Vec<SentencePiece> = Vec::with_capacity(self.seed_size);
+
+        // Add initial_alphabet chars that aren't in corpus (with freq 0)
+        for c in &self.initial_alphabet {
+            all_chars.entry(*c).or_insert(0);
+        }
+
         let mut sall_chars: Vec<(u32, char)> = all_chars.into_iter().map(|(c, f)| (f, c)).collect();
         // Reversed order by frequency
         sall_chars.sort_by_key(|&a| Reverse(a));
