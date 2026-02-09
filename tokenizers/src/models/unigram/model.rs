@@ -565,8 +565,24 @@ impl Unigram {
         Ok((best_i, tokens, score))
     }
 
+    /// Batch version of best_of_cached_weight_sets using Rayon for parallelism.
+    /// Processes multiple sentences in parallel while sharing cached weights (no extra RAM).
+    /// Returns Vec of (winner_index, tokens, score_f32) for each sentence.
+    pub fn best_of_cached_weight_sets_batch(&self, sentences: &[String]) -> Result<Vec<(usize, Vec<String>, f32)>> {
+        use rayon::prelude::*;
+
+        // Validate weights are cached
+        self.cached_weight_sets
+            .as_ref()
+            .ok_or_else(|| Box::new(UnigramError::NoCachedWeights) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        sentences.par_iter()
+            .map(|sentence| self.best_of_cached_weight_sets(sentence.as_str()))
+            .collect()
+    }
+
     /// Keep a convenience version that takes weights via FFI (one-shot),
-    /// but internally reuses the prepared DP so it’s also faster than the old lattice path.
+    /// but internally reuses the prepared DP so it's also faster than the old lattice path.
     /// Returns f64 score for backward-compat.
     pub fn best_of_weight_sets(
         &self,

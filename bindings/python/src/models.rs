@@ -739,6 +739,25 @@ impl PyUnigram {
         }
     }
 
+    /// Batch version: process multiple texts in parallel using Rayon.
+    /// Returns list of (winner_index, tokens, score) for each text.
+    #[pyo3(text_signature = "(self, texts)")]
+    fn best_of_cached_weight_sets_batch(
+        self_: PyRef<Self>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<(usize, Vec<String>, f32)>> {
+        let super_ = self_.as_ref();
+        let model_guard = super_.model.read().unwrap();
+        if let ModelWrapper::Unigram(ref uni) = *model_guard {
+            uni.best_of_cached_weight_sets_batch(&texts)
+                .map_err(|e| exceptions::PyException::new_err(format!("{e}")))
+        } else {
+            Err(exceptions::PyException::new_err(
+                "best_of_cached_weight_sets_batch is only available for Unigram",
+            ))
+        }
+    }
+
     /// Clears the internal cache
     #[pyo3(signature = ())]
     #[pyo3(text_signature = "(self)")]
