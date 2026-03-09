@@ -96,6 +96,10 @@ tracing-subscriber = "0.3.18"
 [profile.release]
 lto = "fat"
 
+[[bin]]
+name = "parity_bpe_train"
+path = "src/bin/parity_bpe_train.rs"
+
 [[example]]
 name = "encode_batch"
 required-features = ["http"]

@@ -2,6 +2,7 @@
 use std::{iter, mem};
 
 mod model;
+pub mod parity_trainer;
 mod serialization;
 pub mod trainer;
 mod word;
@@ -78,5 +79,6 @@ where
 
 // Re-export
 pub use model::*;
+pub use parity_trainer::*;
 pub use trainer::*;
 use word::*;
