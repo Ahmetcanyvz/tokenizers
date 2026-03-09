@@ -328,6 +328,76 @@ class WordLevelTrainer(Trainer):
         """ """
         pass
 
+class ParityBpeTrainer:
+    """
+    Trainer for parity-aware BPE that ensures cross-lingual fairness in tokenization.
+
+    Unlike standard BPE, this trainer takes per-language training files and balances
+    merge operations across languages using a development set or target compression ratios.
+
+    Args:
+        num_merges (:obj:`int`, `optional`):
+            Number of BPE merge operations to perform. Defaults to ``32000``.
+
+        variant (:obj:`str`, `optional`):
+            Algorithm variant: ``"base"`` (default) or ``"window"`` (moving-window balancing).
+
+        min_frequency (:obj:`int`, `optional`):
+            Minimum pair frequency to merge. Defaults to ``2``.
+
+        global_merges (:obj:`int`, `optional`):
+            Number of initial standard BPE merges before switching to parity mode. Defaults to ``0``.
+
+        window_size (:obj:`int`, `optional`):
+            Window size for the ``"window"`` variant. Defaults to ``100``.
+
+        alpha (:obj:`float`, `optional`):
+            Alpha parameter for the ``"window"`` variant. Defaults to ``2.0``.
+
+        total_symbols (:obj:`bool`, `optional`):
+            If True, subtract unique character count from ``num_merges``. Defaults to ``False``.
+    """
+    def __init__(
+        self,
+        num_merges=32000,
+        variant="base",
+        min_frequency=2,
+        ratio=None,
+        global_merges=0,
+        window_size=100,
+        alpha=2.0,
+        total_symbols=False,
+    ):
+        pass
+
+    def train(
+        self,
+        train_files,
+        dev_files=None,
+        ratio=None,
+        output=None,
+    ):
+        """
+        Train parity-aware BPE and return a ready-to-use Tokenizer.
+
+        Args:
+            train_files (:obj:`List[str]`):
+                List of training file paths, one per language.
+
+            dev_files (:obj:`List[str]`, `optional`):
+                List of development file paths for parity computation.
+
+            ratio (:obj:`List[float]`, `optional`):
+                Target compression ratios per language (alternative to dev_files).
+
+            output (:obj:`str`, `optional`):
+                Path to write merge rules to a file.
+
+        Returns:
+            :class:`~tokenizers.Tokenizer`
+        """
+        pass
+
 class WordPieceTrainer(Trainer):
     """
     Trainer capable of training a WordPiece model

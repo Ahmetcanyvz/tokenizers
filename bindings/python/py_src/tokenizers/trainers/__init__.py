@@ -7,3 +7,4 @@ Trainer = trainers.Trainer
 UnigramTrainer = trainers.UnigramTrainer
 WordLevelTrainer = trainers.WordLevelTrainer
 WordPieceTrainer = trainers.WordPieceTrainer
+ParityBpeTrainer = trainers.ParityBpeTrainer
