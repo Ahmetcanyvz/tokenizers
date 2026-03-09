@@ -1,13 +1,20 @@
 use std::sync::{Arc, RwLock};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+
+use ahash::AHashMap;
+use compact_str::CompactString;
 
 use crate::models::PyModel;
-use crate::tokenizer::PyAddedToken;
+use crate::pre_tokenizers::PyPreTokenizer;
+use crate::tokenizer::{PyAddedToken, PyTokenizer};
 use pyo3::exceptions;
 use pyo3::prelude::*;
 use pyo3::types::*;
 use serde::{Deserialize, Serialize};
 use tk::models::TrainerWrapper;
 use tk::Trainer;
+use tk::PreTokenizer as PreTokenizerTrait;
 use tokenizers as tk;
 
 /// Base class for all trainers
@@ -891,6 +898,299 @@ impl PyUnigramTrainer {
     }
 }
 
+fn pre_tokenize_file(
+    path: &str,
+    pre_tokenizer: &tk::pre_tokenizers::sequence::Sequence,
+) -> PyResult<AHashMap<CompactString, u64>> {
+    let file = File::open(path)
+        .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
+    let reader = BufReader::new(file);
+    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
+        let mut pretokenized = tk::PreTokenizedString::from(line.as_str());
+        pre_tokenizer
+            .pre_tokenize(&mut pretokenized)
+            .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
+
+        let splits = pretokenized.get_splits(
+            tk::OffsetReferential::Original,
+            tk::OffsetType::Byte,
+        );
+        for (word, _, _) in splits {
+            if !word.is_empty() {
+                *word_counts.entry(CompactString::from(word)).or_default() += 1;
+            }
+        }
+    }
+    Ok(word_counts)
+}
+
+/// Trainer for parity-aware BPE that ensures cross-lingual fairness in tokenization.
+///
+/// Unlike standard BPE, this trainer takes per-language training files and balances
+/// merge operations across languages using a development set or target compression ratios.
+///
+/// Args:
+///     num_merges (:obj:`int`, `optional`):
+///         Number of BPE merge operations to perform. Defaults to ``32000``.
+///
+///     variant (:obj:`str`, `optional`):
+///         Algorithm variant: ``"base"`` (default) or ``"window"`` (moving-window balancing).
+///
+///     min_frequency (:obj:`int`, `optional`):
+///         Minimum pair frequency to merge. Defaults to ``2``.
+///
+///     global_merges (:obj:`int`, `optional`):
+///         Number of initial standard BPE merges before switching to parity mode. Defaults to ``0``.
+///
+///     window_size (:obj:`int`, `optional`):
+///         Window size for the ``"window"`` variant. Defaults to ``100``.
+///
+///     alpha (:obj:`float`, `optional`):
+///         Alpha parameter for the ``"window"`` variant. Defaults to ``2.0``.
+///
+///     total_symbols (:obj:`bool`, `optional`):
+///         If True, subtract unique character count from ``num_merges``. Defaults to ``False``.
+///
+/// Example::
+///
+///     from tokenizers.trainers import ParityBpeTrainer
+///
+///     trainer = ParityBpeTrainer(num_merges=32000, variant="base")
+///     tokenizer = trainer.train(
+///         train_files=["train_en.txt", "train_de.txt"],
+///         dev_files=["dev_en.txt", "dev_de.txt"],
+///     )
+///     output = tokenizer.encode("Hello world")
+///
+#[pyclass(module = "tokenizers.trainers", name = "ParityBpeTrainer")]
+pub struct PyParityBpeTrainer {
+    num_merges: usize,
+    variant: String,
+    min_frequency: u64,
+    ratio: Option<Vec<f64>>,
+    global_merges: usize,
+    window_size: usize,
+    alpha: f64,
+    total_symbols: bool,
+}
+
+#[pymethods]
+impl PyParityBpeTrainer {
+    #[new]
+    #[pyo3(signature = (
+        num_merges = 32000,
+        variant = "base",
+        min_frequency = 2,
+        ratio = None,
+        global_merges = 0,
+        window_size = 100,
+        alpha = 2.0,
+        total_symbols = false
+    ))]
+    fn new(
+        num_merges: usize,
+        variant: &str,
+        min_frequency: u64,
+        ratio: Option<Vec<f64>>,
+        global_merges: usize,
+        window_size: usize,
+        alpha: f64,
+        total_symbols: bool,
+    ) -> PyResult<Self> {
+        match variant {
+            "base" | "window" => {}
+            _ => return Err(exceptions::PyValueError::new_err(
+                format!("Unknown variant '{}'. Use 'base' or 'window'.", variant)
+            )),
+        }
+        Ok(PyParityBpeTrainer {
+            num_merges,
+            variant: variant.to_string(),
+            min_frequency,
+            ratio,
+            global_merges,
+            window_size,
+            alpha,
+            total_symbols,
+        })
+    }
+
+    /// Train parity-aware BPE and return a ready-to-use Tokenizer.
+    ///
+    /// Args:
+    ///     train_files (:obj:`List[str]`):
+    ///         List of training file paths, one per language.
+    ///
+    ///     dev_files (:obj:`List[str]`, `optional`):
+    ///         List of development file paths for parity computation (multi-parallel).
+    ///
+    ///     ratio (:obj:`List[float]`, `optional`):
+    ///         Target compression ratios per language (alternative to ``dev_files``).
+    ///
+    ///     output (:obj:`str`, `optional`):
+    ///         Path to write merge rules to a file.
+    ///
+    /// Returns:
+    ///     :class:`~tokenizers.Tokenizer`: A trained tokenizer with BPE model and
+    ///     pre-tokenizer (Whitespace + ByteLevel) already configured.
+    #[pyo3(signature = (train_files, dev_files = None, ratio = None, output = None))]
+    fn train(
+        &self,
+        train_files: Vec<String>,
+        dev_files: Option<Vec<String>>,
+        ratio: Option<Vec<f64>>,
+        output: Option<String>,
+    ) -> PyResult<PyTokenizer> {
+        use tk::models::bpe::{ParityBpeTrainer as RustTrainer, ParityVariant, BPE};
+        use tk::pre_tokenizers::byte_level::ByteLevel;
+        use tk::pre_tokenizers::sequence::Sequence;
+        use tk::pre_tokenizers::whitespace::Whitespace;
+        use tk::pre_tokenizers::PreTokenizerWrapper;
+        use tk::tokenizer::TokenizerImpl;
+
+        if train_files.is_empty() {
+            return Err(exceptions::PyValueError::new_err("train_files must not be empty"));
+        }
+
+        let parity_variant = match self.variant.as_str() {
+            "base" => ParityVariant::Base,
+            "window" => ParityVariant::Window,
+            _ => unreachable!(),
+        };
+
+        let pre_tokenizer = Sequence::new(vec![
+            PreTokenizerWrapper::Whitespace(Whitespace),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(true, true, false)),
+        ]);
+
+        // Use ratio from train() arg, fall back to constructor arg
+        let effective_ratio = ratio.or_else(|| self.ratio.clone());
+
+        let mut builder = RustTrainer::builder()
+            .min_frequency(self.min_frequency)
+            .num_merges(self.num_merges)
+            .show_progress(true)
+            .variant(parity_variant)
+            .global_merges(self.global_merges)
+            .window_size(self.window_size)
+            .alpha(self.alpha)
+            .total_symbols(self.total_symbols);
+
+        if let Some(r) = effective_ratio {
+            builder = builder.ratio(r);
+        }
+
+        let mut trainer = builder.build();
+
+        // Feed training data
+        for (lang, path) in train_files.iter().enumerate() {
+            let word_counts = pre_tokenize_file(path, &pre_tokenizer)?;
+            trainer.feed_language(lang, word_counts);
+        }
+
+        // Feed dev data
+        if let Some(ref dev) = dev_files {
+            for (lang, path) in dev.iter().enumerate() {
+                let word_counts = pre_tokenize_file(path, &pre_tokenizer)?;
+                trainer.feed_dev_language(lang, word_counts);
+            }
+        }
+
+        // Train
+        let mut model = BPE::default();
+        let (_special_tokens, merge_strings) = trainer
+            .do_train(&mut model)
+            .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Training error: {}", e)))?;
+
+        // Write output file if requested
+        if let Some(ref out_path) = output {
+            use std::io::Write;
+            let mut out = File::create(out_path)
+                .map_err(|e| exceptions::PyIOError::new_err(format!("Cannot create {}: {}", out_path, e)))?;
+            writeln!(out, "#version: 0.2").map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+            for merge_line in &merge_strings {
+                writeln!(out, "{}", merge_line).map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+            }
+        }
+
+        // Build vocab from merges
+        let alphabet = tk::pre_tokenizers::byte_level::ByteLevel::alphabet();
+        let mut vocab: Vec<(String, u32)> = alphabet
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.to_string(), i as u32))
+            .collect();
+
+        let mut merges_tuples = Vec::new();
+        let mut index = vocab.len() as u32;
+        for line in &merge_strings {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 2 {
+                merges_tuples.push((parts[0].to_string(), parts[1].to_string()));
+                vocab.push((format!("{}{}", parts[0], parts[1]), index));
+                index += 1;
+            }
+        }
+
+        // Create BPE model from vocab + merges
+        let vocab_map: AHashMap<String, u32> = vocab.into_iter().collect();
+        let bpe_model = BPE::builder()
+            .vocab_and_merges(vocab_map, merges_tuples)
+            .build()
+            .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Failed to build BPE model: {}", e)))?;
+
+        // Create tokenizer with proper Python wrapper types
+        let py_model: PyModel = bpe_model.into();
+        let py_pre_tok: PyPreTokenizer = pre_tokenizer.into();
+        let mut tokenizer = TokenizerImpl::new(py_model);
+        tokenizer.with_pre_tokenizer(Some(py_pre_tok));
+
+        Ok(PyTokenizer { tokenizer })
+    }
+
+    #[getter]
+    fn get_num_merges(&self) -> usize { self.num_merges }
+
+    #[setter]
+    fn set_num_merges(&mut self, v: usize) { self.num_merges = v; }
+
+    #[getter]
+    fn get_variant(&self) -> &str { &self.variant }
+
+    #[getter]
+    fn get_min_frequency(&self) -> u64 { self.min_frequency }
+
+    #[setter]
+    fn set_min_frequency(&mut self, v: u64) { self.min_frequency = v; }
+
+    #[getter]
+    fn get_global_merges(&self) -> usize { self.global_merges }
+
+    #[setter]
+    fn set_global_merges(&mut self, v: usize) { self.global_merges = v; }
+
+    #[getter]
+    fn get_window_size(&self) -> usize { self.window_size }
+
+    #[setter]
+    fn set_window_size(&mut self, v: usize) { self.window_size = v; }
+
+    #[getter]
+    fn get_alpha(&self) -> f64 { self.alpha }
+
+    #[setter]
+    fn set_alpha(&mut self, v: f64) { self.alpha = v; }
+
+    #[getter]
+    fn get_total_symbols(&self) -> bool { self.total_symbols }
+
+    #[setter]
+    fn set_total_symbols(&mut self, v: bool) { self.total_symbols = v; }
+}
+
 /// Trainers Module
 #[pymodule]
 pub fn trainers(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -899,6 +1199,7 @@ pub fn trainers(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordPieceTrainer>()?;
     m.add_class::<PyWordLevelTrainer>()?;
     m.add_class::<PyUnigramTrainer>()?;
+    m.add_class::<PyParityBpeTrainer>()?;
     Ok(())
 }
 

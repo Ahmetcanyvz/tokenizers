@@ -22,6 +22,7 @@ numpy = "0.25"
 ndarray = "0.16"
 itertools = "0.14"
 ahash = { version = "0.8.11", features = ["serde"] }
+compact_str = "0.9"
 
 [dependencies.tokenizers]
 path = "../../tokenizers"
