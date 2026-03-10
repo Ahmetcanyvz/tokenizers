@@ -771,10 +771,21 @@ impl ParityBpeTrainer {
 
         self.update_progress(&progress, num_merges, "Compute merges");
         let mut merges: Vec<(Pair, u32)> = vec![];
+        let mut exhausted: AHashSet<usize> = AHashSet::new();
+        let mut merge_count = 0;
 
-        for i in 0..num_merges {
+        while merge_count < num_merges {
+            // Check if all languages are exhausted
+            if exhausted.len() >= num_langs {
+                eprintln!(
+                    "All {} languages exhausted, stopping at {} merges",
+                    num_langs, merge_count
+                );
+                break;
+            }
+
             // Select which language to optimize
-            let lang_idx = if i < self.global_merges {
+            let lang_idx = if merge_count < self.global_merges {
                 usize::MAX // signals "use global"
             } else if has_ratio {
                 let ratio_vec = self.ratio.as_ref().unwrap();
@@ -790,12 +801,11 @@ impl ParityBpeTrainer {
                 match self.variant {
                     ParityVariant::Base => {
                         // min(enumerate(adjusted)) — pick language with least adjusted compression
-                        // Python: min(enumerate(adjusted_compression_rates), key=operator.itemgetter(1))
-                        // Returns FIRST minimum (lowest index on ties)
+                        // Skip exhausted languages
                         let mut best_idx = 0;
-                        let mut best_val = adjusted[0];
-                        for (idx, &val) in adjusted.iter().enumerate().skip(1) {
-                            if val < best_val {
+                        let mut best_val = f64::INFINITY;
+                        for (idx, &val) in adjusted.iter().enumerate() {
+                            if !exhausted.contains(&idx) && val < best_val {
                                 best_val = val;
                                 best_idx = idx;
                             }
@@ -804,8 +814,11 @@ impl ParityBpeTrainer {
                     }
                     ParityVariant::Window => {
                         // Python: select_language_index(-adjusted_compression_rates, ...)
-                        let neg_adjusted: Vec<f64> =
+                        let mut neg_adjusted: Vec<f64> =
                             adjusted.iter().map(|&v| -v).collect();
+                        for &ex in &exhausted {
+                            neg_adjusted[ex] = f64::NEG_INFINITY;
+                        }
                         let idx = self.select_language_window_f64(
                             &neg_adjusted,
                             &selected_indices,
@@ -822,12 +835,11 @@ impl ParityBpeTrainer {
                 match self.variant {
                     ParityVariant::Base => {
                         // Pick language with longest total token length.
-                        // Use manual loop to match Python's max(enumerate(lengths))
-                        // which returns the FIRST maximum (lowest index on ties).
+                        // Skip exhausted languages.
                         let mut best_idx = 0;
-                        let mut best_val = lengths[0];
-                        for (idx, &val) in lengths.iter().enumerate().skip(1) {
-                            if val > best_val {
+                        let mut best_val = i64::MIN;
+                        for (idx, &val) in lengths.iter().enumerate() {
+                            if !exhausted.contains(&idx) && val > best_val {
                                 best_val = val;
                                 best_idx = idx;
                             }
@@ -835,8 +847,12 @@ impl ParityBpeTrainer {
                         best_idx
                     }
                     ParityVariant::Window => {
+                        let mut effective_lengths = lengths.clone();
+                        for &ex in &exhausted {
+                            effective_lengths[ex] = i64::MIN;
+                        }
                         let idx = self.select_language_window(
-                            &lengths,
+                            &effective_lengths,
                             &selected_indices,
                             selection_threshold,
                         );
@@ -856,13 +872,21 @@ impl ParityBpeTrainer {
                 self.find_best_pair_linear(&per_lang_pair_counts[lang_idx], &id_to_word)
             };
 
-            let Some((best_pair, best_count)) = best_pair else {
-                break;
+            let (best_pair, _best_count) = match best_pair {
+                Some((p, c)) if c >= self.min_frequency => (p, c),
+                _ => {
+                    if lang_idx == usize::MAX {
+                        // Global mode exhausted — no valid pairs across any language
+                        break;
+                    }
+                    eprintln!(
+                        "Language {} exhausted at merge {}, skipping",
+                        lang_idx, merge_count
+                    );
+                    exhausted.insert(lang_idx);
+                    continue;
+                }
             };
-
-            if best_count < self.min_frequency {
-                break;
-            }
 
             // Build new token
             let part_a = &id_to_word[best_pair.0 as usize];
@@ -916,12 +940,18 @@ impl ParityBpeTrainer {
                 }
             }
 
+            merge_count += 1;
             if let Some(p) = &progress {
                 p.inc(1);
             }
         }
 
         self.finalize_progress(&progress, merges.len());
+        eprintln!(
+            "Training complete: {} merges, {} vocab size",
+            merges.len(),
+            id_to_word.len()
+        );
 
         // Build ordered merge strings for output
         let merge_strings: Vec<String> = merges
