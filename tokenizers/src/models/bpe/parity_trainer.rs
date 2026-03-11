@@ -1082,104 +1082,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parity_base_two_languages() {
-        // Language 1: heavy on "ab" pairs
-        let lang1: AHashMap<CompactString, u64> = [
-            ("abab".into(), 10u64),
-            ("cd".into(), 1),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // Language 2: heavy on "cd" pairs
-        let lang2: AHashMap<CompactString, u64> = [
-            ("ab".into(), 1u64),
-            ("cdcd".into(), 10),
-        ]
-        .iter()
-        .cloned()
-        .collect();
+    fn test_parity_base_exact_merges() {
+        // Symmetric two-language data, no dev set.
+        // Lang 0: "aabb" x10, Lang 1: "ccdd" x10
+        let lang0: AHashMap<CompactString, u64> = [("aabb".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("ccdd".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
 
         let mut trainer = ParityBpeTrainer::builder()
             .show_progress(false)
             .min_frequency(1)
-            .vocab_size(100)
+            .num_merges(6)
             .variant(ParityVariant::Base)
             .build();
 
-        trainer.feed_language(0, lang1);
-        trainer.feed_language(1, lang2);
-
-        let mut model = BPE::default();
-        trainer.do_train(&mut model).unwrap();
-
-        // Both "ab" and "cd" merges should have been learned
-        assert!(model.vocab.len() > 4);
-    }
-
-    #[test]
-    fn test_parity_base_with_dev() {
-        // Training data
-        let train1: AHashMap<CompactString, u64> = [
-            ("abab".into(), 10u64),
-            ("cd".into(), 5),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let train2: AHashMap<CompactString, u64> = [
-            ("ab".into(), 5u64),
-            ("cdcd".into(), 10),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        // Dev data (drives language selection)
-        let dev1: AHashMap<CompactString, u64> = [
-            ("abab".into(), 3u64),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let dev2: AHashMap<CompactString, u64> = [
-            ("cdcd".into(), 3u64),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let mut trainer = ParityBpeTrainer::builder()
-            .show_progress(false)
-            .min_frequency(1)
-            .num_merges(4)
-            .variant(ParityVariant::Base)
-            .build();
-
-        trainer.feed_language(0, train1);
-        trainer.feed_language(1, train2);
-        trainer.feed_dev_language(0, dev1);
-        trainer.feed_dev_language(1, dev2);
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
 
         let mut model = BPE::default();
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
-        // Should produce merges for both languages
-        assert!(!merge_strings.is_empty());
-        assert!(merge_strings.len() <= 4);
+        // Languages are tied in length, so either could go first.
+        // If lang 0 first: b b, d d, a bb, c dd, a abb, c cdd
+        // If lang 1 first: d d, b b, c dd, a bb, c cdd, a abb
+        let lang0_first = vec!["b b", "d d", "a bb", "c dd", "a abb", "c cdd"];
+        let lang1_first = vec!["d d", "b b", "c dd", "a bb", "c cdd", "a abb"];
+        assert!(
+            merge_strings == lang0_first || merge_strings == lang1_first,
+            "expected alternating merges; got {:?}",
+            merge_strings
+        );
+        assert!(
+            model.vocab.contains_key("aabb"),
+            "final token 'aabb' should be in vocab"
+        );
+        assert!(
+            model.vocab.contains_key("ccdd"),
+            "final token 'ccdd' should be in vocab"
+        );
     }
 
     #[test]
-    fn test_parity_window_variant() {
-        let lang1: AHashMap<CompactString, u64> = [("aaaa".into(), 10u64)]
+    fn test_parity_base_dev_drives_selection() {
+        // Asymmetric training data with inverted dev data.
+        // Train lang 0 is larger, but dev lang 1 is larger — dev should win.
+        let train0: AHashMap<CompactString, u64> = [("ab".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let train1: AHashMap<CompactString, u64> = [("cd".into(), 5u64)]
             .iter()
             .cloned()
             .collect();
 
-        let lang2: AHashMap<CompactString, u64> = [("bbbb".into(), 10u64)]
+        // Dev inverts the priority: lang 1 has more data
+        let dev0: AHashMap<CompactString, u64> = [("ab".into(), 1u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let dev1: AHashMap<CompactString, u64> = [("cd".into(), 10u64)]
             .iter()
             .cloned()
             .collect();
@@ -1187,19 +1153,257 @@ mod tests {
         let mut trainer = ParityBpeTrainer::builder()
             .show_progress(false)
             .min_frequency(1)
-            .vocab_size(20)
-            .variant(ParityVariant::Window)
-            .window_size(4)
-            .alpha(2.0)
+            .num_merges(2)
+            .variant(ParityVariant::Base)
             .build();
 
-        trainer.feed_language(0, lang1);
-        trainer.feed_language(1, lang2);
+        trainer.feed_language(0, train0);
+        trainer.feed_language(1, train1);
+        trainer.feed_dev_language(0, dev0);
+        trainer.feed_dev_language(1, dev1);
 
         let mut model = BPE::default();
-        trainer.do_train(&mut model).unwrap();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
-        // Both "aa" and "bb" should be in the vocab
-        assert!(model.vocab.contains_key("aa") || model.vocab.contains_key("bb"));
+        // Dev lengths: lang 0 = 2 chars, lang 1 = 20 chars
+        // Lang 1 selected first despite smaller training data
+        // 'c' + 'd' -> 'cd' (lang 1 first)
+        // 'a' + 'b' -> 'ab' (lang 0 second)
+        assert_eq!(
+            merge_strings,
+            vec!["c d", "a b"],
+            "dev set should drive language selection: lang 1 first"
+        );
+    }
+
+    #[test]
+    fn test_parity_window_ensures_fairness() {
+        // Highly asymmetric data: lang 0 dominates in length.
+        // Base would give lang 0 all its merges first.
+        // Window (alpha=1.0, window_size=2) forces lang 1 to get turns earlier.
+        //
+        // threshold = alpha / num_langs = 1.0 / 2 = 0.5
+        // After lang 0 fills >50% of the window, it gets masked.
+        let lang0: AHashMap<CompactString, u64> = [("aabb".into(), 100u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("ccdd".into(), 1u64)]
+            .iter()
+            .cloned()
+            .collect();
+
+        // Base variant: lang 0 monopolizes until exhausted
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(6)
+            .variant(ParityVariant::Base)
+            .build();
+        trainer.feed_language(0, lang0.clone());
+        trainer.feed_language(1, lang1.clone());
+        let mut model = BPE::default();
+        let (_special, base_merges) = trainer.do_train(&mut model).unwrap();
+        // Base: lang 0 always longest, takes all 3 merges before lang 1 gets any
+        assert_eq!(
+            base_merges,
+            vec!["b b", "a bb", "a abb", "d d", "c dd", "c cdd"],
+            "Base should let lang 0 monopolize merges"
+        );
+
+        // Window variant: forces interleaving
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(6)
+            .variant(ParityVariant::Window)
+            .window_size(2)
+            .alpha(1.0)
+            .build();
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+        let mut model = BPE::default();
+        let (_special, window_merges) = trainer.do_train(&mut model).unwrap();
+        // Window: after 2 consecutive lang 0 picks, ratio=2/2=1.0 > 0.5 threshold,
+        // so lang 0 is masked and lang 1 gets "d d" at step 3 instead of step 4.
+        assert_eq!(
+            window_merges,
+            vec!["b b", "a bb", "d d", "a abb", "c dd", "c cdd"],
+            "Window should force lang 1's first merge earlier than Base"
+        );
+        // Key difference: lang 1's first merge is at index 2 (Window) vs 3 (Base)
+        assert_ne!(
+            base_merges, window_merges,
+            "Window and Base should produce different merge orders"
+        );
+    }
+
+    #[test]
+    fn test_parity_exhausted_language_continues() {
+        // Lang 0 has only 1 possible pair ("a"+"b"), lang 1 has 3 ("e"+"f", "d"+"ef", "c"+"def").
+        // No dev set — training data lengths drive language selection.
+        // Training should skip exhausted lang 0 and continue with lang 1.
+        let lang0: AHashMap<CompactString, u64> = [("ab".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("cdef".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(10) // request more merges than possible
+            .variant(ParityVariant::Base)
+            .build();
+
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+
+        // Lang 1 selected first (longer: 4*10=40 vs 2*10=20)
+        // 'e' + 'f' -> 'ef' (lang 1, length now 3*10=30)
+        // Lang 1 still longer (30 vs 20), selected again:
+        // 'd' + 'ef' -> 'def' (lang 1, length now 2*10=20)
+        // Tied at 20, lang 0 wins by index:
+        // 'a' + 'b' -> 'ab' (lang 0, now exhausted)
+        // Lang 0 exhausted, skip to lang 1:
+        // 'c' + 'def' -> 'cdef' (lang 1)
+        // Only 4 merges possible despite requesting 10
+        assert_eq!(
+            merge_strings,
+            vec!["e f", "d ef", "a b", "c def"],
+            "should produce exactly 4 merges; exhausted lang 0 skipped"
+        );
+    }
+
+    #[test]
+    fn test_parity_global_merges() {
+        // Same data trained with global_merges=1 vs global_merges=0.
+        // Global warmup uses concatenated statistics, changing merge order.
+        let make_data = || {
+            let lang0: AHashMap<CompactString, u64> = [
+                ("ab".into(), 5u64),
+                ("cd".into(), 1),
+            ]
+            .iter()
+            .cloned()
+            .collect();
+            let lang1: AHashMap<CompactString, u64> = [
+                ("ab".into(), 1u64),
+                ("cd".into(), 5),
+            ]
+            .iter()
+            .cloned()
+            .collect();
+            (lang0, lang1)
+        };
+
+        // With global_merges=1: first merge uses global stats (ab:6, cd:6 — tied,
+        // 'c'+'d' wins alphabetically), then per-language for the rest.
+        let (lang0, lang1) = make_data();
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(2)
+            .global_merges(1)
+            .variant(ParityVariant::Base)
+            .build();
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+        assert_eq!(
+            merge_strings,
+            vec!["c d", "a b"],
+            "global merge should pick 'c d' first (alphabetic tie-break)"
+        );
+
+        // With global_merges=0: per-language from the start.
+        // Lang 0 selected first (longer: 5*2+1*2=12 vs 1*2+5*2=12 — tied,
+        // lang 0 wins by index), lang 0's best pair is "ab" (freq 5).
+        let (lang0, lang1) = make_data();
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(2)
+            .global_merges(0)
+            .variant(ParityVariant::Base)
+            .build();
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+        assert_eq!(
+            merge_strings,
+            vec!["a b", "c d"],
+            "without global merges, lang 0 picks 'a b' first"
+        );
+    }
+
+    #[test]
+    fn test_parity_min_frequency() {
+        // Lang 0: "ab" x10 (pair freq 10), "cd" x3 (pair freq 3 — below threshold)
+        // Lang 1: "ef" x10, "gh" x10
+        // min_frequency=5 filters out "cd" pair
+        let lang0: AHashMap<CompactString, u64> = [
+            ("ab".into(), 10u64),
+            ("cd".into(), 3),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        let lang1: AHashMap<CompactString, u64> = [
+            ("ef".into(), 10u64),
+            ("gh".into(), 10),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(5)
+            .num_merges(10)
+            .variant(ParityVariant::Base)
+            .build();
+
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+
+        // Lang 1 total length: 10*2 + 10*2 = 40, Lang 0: 10*2 + 3*2 = 26
+        // Lang 1 first: 'g'+'h' -> 'gh' (freq 10, tied with 'ef'; 'g'>'e' — actually
+        // the trainer picks highest freq first, both 10; tie-break by pair)
+        // Lang 0: 'a'+'b' -> 'ab' (freq 10; 'cd' freq 3 < min_frequency=5, filtered)
+        // Lang 1: 'e'+'f' -> 'ef' (freq 10)
+        // Lang 0 exhausted (only valid pair was "ab"), all done
+        assert_eq!(
+            merge_strings.len(),
+            3,
+            "expected 3 merges; 'cd' pair (freq 3) should be filtered by min_frequency=5"
+        );
+        assert!(
+            merge_strings.contains(&"a b".to_string()),
+            "'a b' merge should be present"
+        );
+        assert!(
+            merge_strings.contains(&"e f".to_string()),
+            "'e f' merge should be present"
+        );
+        assert!(
+            merge_strings.contains(&"g h".to_string()),
+            "'g h' merge should be present"
+        );
+        assert!(
+            !model.vocab.contains_key("cd"),
+            "'cd' should NOT be in vocab (pair freq 3 < min_frequency 5)"
+        );
     }
 }
