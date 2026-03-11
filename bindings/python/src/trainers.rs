@@ -6,6 +6,7 @@ use ahash::AHashMap;
 use compact_str::CompactString;
 
 use crate::models::PyModel;
+use crate::normalizers::PyNormalizer;
 use crate::pre_tokenizers::PyPreTokenizer;
 use crate::tokenizer::{PyAddedToken, PyTokenizer};
 use pyo3::exceptions;
@@ -13,8 +14,9 @@ use pyo3::prelude::*;
 use pyo3::types::*;
 use serde::{Deserialize, Serialize};
 use tk::models::TrainerWrapper;
-use tk::Trainer;
+use tk::Normalizer as NormalizerTrait;
 use tk::PreTokenizer as PreTokenizerTrait;
+use tk::Trainer;
 use tokenizers as tk;
 
 /// Base class for all trainers
@@ -899,7 +901,8 @@ impl PyUnigramTrainer {
 
 fn pre_tokenize_file(
     path: &str,
-    pre_tokenizer: &tk::pre_tokenizers::sequence::Sequence,
+    normalizer: Option<&PyNormalizer>,
+    pre_tokenizer: Option<&PyPreTokenizer>,
 ) -> PyResult<AHashMap<CompactString, u64>> {
     let file = File::open(path)
         .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
@@ -908,16 +911,36 @@ fn pre_tokenize_file(
 
     for line in reader.lines() {
         let line = line.map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
-        let mut pretokenized = tk::PreTokenizedString::from(line.as_str());
-        pre_tokenizer
-            .pre_tokenize(&mut pretokenized)
-            .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
 
-        let splits = pretokenized.get_splits(
-            tk::OffsetReferential::Original,
-            tk::OffsetType::Byte,
-        );
-        for (word, _, _) in splits {
+        // Normalize (mirrors tokenizer/mod.rs:1408-1410)
+        let normalized_text = if let Some(norm) = normalizer {
+            let mut normalized = tk::NormalizedString::from(line.as_str());
+            norm.normalize(&mut normalized)
+                .map_err(|e| exceptions::PyValueError::new_err(format!("Normalization error: {}", e)))?;
+            normalized.get().to_string()
+        } else {
+            line
+        };
+
+        // Pre-tokenize (mirrors tokenizer/mod.rs:1411-1416)
+        if let Some(pretok) = pre_tokenizer {
+            let mut pretokenized = tk::PreTokenizedString::from(normalized_text.as_str());
+            pretok
+                .pre_tokenize(&mut pretokenized)
+                .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
+
+            let splits = pretokenized.get_splits(
+                tk::OffsetReferential::Original,
+                tk::OffsetType::Byte,
+            );
+            for (word, _, _) in splits {
+                if !word.is_empty() {
+                    *word_counts.entry(CompactString::from(word)).or_default() += 1;
+                }
+            }
+        } else {
+            // No pre-tokenizer: treat whole line as one word
+            let word = normalized_text.trim();
             if !word.is_empty() {
                 *word_counts.entry(CompactString::from(word)).or_default() += 1;
             }
@@ -955,13 +978,17 @@ fn pre_tokenize_file(
 ///
 /// Example::
 ///
+///     from tokenizers import Tokenizer
+///     from tokenizers.models import BPE
+///     from tokenizers import pre_tokenizers
 ///     from tokenizers.trainers import ParityBpeTrainer
 ///
+///     tokenizer = Tokenizer(BPE())
+///     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+///
 ///     trainer = ParityBpeTrainer(num_merges=32000, variant="base")
-///     tokenizer = trainer.train(
-///         train_files=["train_en.txt", "train_de.txt"],
-///         dev_files=["dev_en.txt", "dev_de.txt"],
-///     )
+///     trainer.train(tokenizer, train_files=["train_en.txt", "train_de.txt"],
+///                   dev_files=["dev_en.txt", "dev_de.txt"])
 ///     output = tokenizer.encode("Hello world")
 ///
 #[pyclass(module = "tokenizers.trainers", name = "ParityBpeTrainer")]
@@ -1017,9 +1044,17 @@ impl PyParityBpeTrainer {
         })
     }
 
-    /// Train parity-aware BPE and return a ready-to-use Tokenizer.
+    /// Train a user-configured tokenizer with parity-aware BPE in-place.
+    ///
+    /// The tokenizer's normalizer and pre-tokenizer (if set) are used during
+    /// training, matching the standard ``tokenizer.train(files, trainer)``
+    /// workflow.  After training the model is set on the tokenizer directly.
     ///
     /// Args:
+    ///     tokenizer (:class:`~tokenizers.Tokenizer`):
+    ///         A tokenizer instance to train.  Its pre-tokenizer (and optionally
+    ///         normalizer) should already be configured.
+    ///
     ///     train_files (:obj:`List[str]`):
     ///         List of training file paths, one per language.
     ///
@@ -1031,24 +1066,16 @@ impl PyParityBpeTrainer {
     ///
     ///     output (:obj:`str`, `optional`):
     ///         Path to write merge rules to a file.
-    ///
-    /// Returns:
-    ///     :class:`~tokenizers.Tokenizer`: A trained tokenizer with BPE model and
-    ///     pre-tokenizer (Whitespace + ByteLevel) already configured.
-    #[pyo3(signature = (train_files, dev_files = None, ratio = None, output = None))]
+    #[pyo3(signature = (tokenizer, train_files, dev_files = None, ratio = None, output = None))]
     fn train(
         &self,
+        tokenizer: &mut PyTokenizer,
         train_files: Vec<String>,
         dev_files: Option<Vec<String>>,
         ratio: Option<Vec<f64>>,
         output: Option<String>,
-    ) -> PyResult<PyTokenizer> {
+    ) -> PyResult<()> {
         use tk::models::bpe::{ParityBpeTrainer as RustTrainer, ParityVariant, BPE};
-        use tk::pre_tokenizers::byte_level::ByteLevel;
-        use tk::pre_tokenizers::sequence::Sequence;
-        use tk::pre_tokenizers::whitespace::Whitespace;
-        use tk::pre_tokenizers::PreTokenizerWrapper;
-        use tk::tokenizer::TokenizerImpl;
 
         if train_files.is_empty() {
             return Err(exceptions::PyValueError::new_err("train_files must not be empty"));
@@ -1060,10 +1087,9 @@ impl PyParityBpeTrainer {
             _ => unreachable!(),
         };
 
-        let pre_tokenizer = Sequence::new(vec![
-            PreTokenizerWrapper::Whitespace(Whitespace),
-            PreTokenizerWrapper::ByteLevel(ByteLevel::new(true, true, false)),
-        ]);
+        // Extract normalizer and pre-tokenizer from the user-configured tokenizer
+        let normalizer = tokenizer.tokenizer.get_normalizer().cloned();
+        let pre_tokenizer = tokenizer.tokenizer.get_pre_tokenizer().cloned();
 
         // Use ratio from train() arg, fall back to constructor arg
         let effective_ratio = ratio.or_else(|| self.ratio.clone());
@@ -1086,21 +1112,21 @@ impl PyParityBpeTrainer {
 
         // Feed training data
         for (lang, path) in train_files.iter().enumerate() {
-            let word_counts = pre_tokenize_file(path, &pre_tokenizer)?;
+            let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
             trainer.feed_language(lang, word_counts);
         }
 
         // Feed dev data
         if let Some(ref dev) = dev_files {
             for (lang, path) in dev.iter().enumerate() {
-                let word_counts = pre_tokenize_file(path, &pre_tokenizer)?;
+                let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
                 trainer.feed_dev_language(lang, word_counts);
             }
         }
 
-        // Train
+        // Train — do_train populates model.vocab, model.vocab_r, and model.merges
         let mut model = BPE::default();
-        let (_special_tokens, merge_strings) = trainer
+        let (special_tokens, merge_strings) = trainer
             .do_train(&mut model)
             .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Training error: {}", e)))?;
 
@@ -1115,39 +1141,12 @@ impl PyParityBpeTrainer {
             }
         }
 
-        // Build vocab from merges
-        let alphabet = tk::pre_tokenizers::byte_level::ByteLevel::alphabet();
-        let mut vocab: Vec<(String, u32)> = alphabet
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.to_string(), i as u32))
-            .collect();
+        // Set the trained model on the tokenizer in-place
+        let py_model: PyModel = model.into();
+        tokenizer.tokenizer.with_model(py_model);
+        tokenizer.tokenizer.add_special_tokens(&special_tokens);
 
-        let mut merges_tuples = Vec::new();
-        let mut index = vocab.len() as u32;
-        for line in &merge_strings {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 2 {
-                merges_tuples.push((parts[0].to_string(), parts[1].to_string()));
-                vocab.push((format!("{}{}", parts[0], parts[1]), index));
-                index += 1;
-            }
-        }
-
-        // Create BPE model from vocab + merges
-        let vocab_map: AHashMap<String, u32> = vocab.into_iter().collect();
-        let bpe_model = BPE::builder()
-            .vocab_and_merges(vocab_map, merges_tuples)
-            .build()
-            .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Failed to build BPE model: {}", e)))?;
-
-        // Create tokenizer with proper Python wrapper types
-        let py_model: PyModel = bpe_model.into();
-        let py_pre_tok: PyPreTokenizer = pre_tokenizer.into();
-        let mut tokenizer = TokenizerImpl::new(py_model);
-        tokenizer.with_pre_tokenizer(Some(py_pre_tok));
-
-        Ok(PyTokenizer { tokenizer })
+        Ok(())
     }
 
     #[getter]

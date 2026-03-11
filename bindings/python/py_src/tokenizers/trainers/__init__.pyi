@@ -372,15 +372,20 @@ class ParityBpeTrainer:
 
     def train(
         self,
+        tokenizer,
         train_files,
         dev_files=None,
         ratio=None,
         output=None,
     ):
         """
-        Train parity-aware BPE and return a ready-to-use Tokenizer.
+        Train a user-configured tokenizer with parity-aware BPE in-place.
 
         Args:
+            tokenizer (:class:`~tokenizers.Tokenizer`):
+                A tokenizer instance to train.  Its pre-tokenizer (and optionally
+                normalizer) should already be configured.
+
             train_files (:obj:`List[str]`):
                 List of training file paths, one per language.
 
@@ -392,9 +397,6 @@ class ParityBpeTrainer:
 
             output (:obj:`str`, `optional`):
                 Path to write merge rules to a file.
-
-        Returns:
-            :class:`~tokenizers.Tokenizer`
         """
         pass
 
