@@ -373,10 +373,11 @@ class ParityBpeTrainer:
     def train(
         self,
         tokenizer,
-        train_files,
+        train_files=None,
         dev_files=None,
         ratio=None,
         output=None,
+        config=None,
     ):
         """
         Train a user-configured tokenizer with parity-aware BPE in-place.
@@ -386,8 +387,9 @@ class ParityBpeTrainer:
                 A tokenizer instance to train.  Its pre-tokenizer (and optionally
                 normalizer) should already be configured.
 
-            train_files (:obj:`List[str]`):
+            train_files (:obj:`List[str]`, `optional`):
                 List of training file paths, one per language.
+                Either ``train_files`` or ``config`` must be provided.
 
             dev_files (:obj:`List[str]`, `optional`):
                 List of development file paths for parity computation.
@@ -397,6 +399,12 @@ class ParityBpeTrainer:
 
             output (:obj:`str`, `optional`):
                 Path to write merge rules to a file.
+
+            config (:obj:`str`, `optional`):
+                Path to a JSON config file defining language groups with input files
+                and compression ratios. When provided, overrides ``train_files``,
+                ``dev_files``, and ``ratio``. Parquet files are auto-detected by
+                ``.parquet`` extension.
         """
         pass
 

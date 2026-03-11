@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use ahash::AHashMap;
+use arrow::array::Array;
 use compact_str::CompactString;
 
 use crate::models::PyModel;
@@ -899,6 +900,47 @@ impl PyUnigramTrainer {
     }
 }
 
+fn pre_tokenize_text(
+    text: &str,
+    normalizer: Option<&PyNormalizer>,
+    pre_tokenizer: Option<&PyPreTokenizer>,
+    word_counts: &mut AHashMap<CompactString, u64>,
+) -> PyResult<()> {
+    // Normalize
+    let normalized_text = if let Some(norm) = normalizer {
+        let mut normalized = tk::NormalizedString::from(text);
+        norm.normalize(&mut normalized)
+            .map_err(|e| exceptions::PyValueError::new_err(format!("Normalization error: {}", e)))?;
+        normalized.get().to_string()
+    } else {
+        text.to_string()
+    };
+
+    // Pre-tokenize
+    if let Some(pretok) = pre_tokenizer {
+        let mut pretokenized = tk::PreTokenizedString::from(normalized_text.as_str());
+        pretok
+            .pre_tokenize(&mut pretokenized)
+            .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
+
+        let splits = pretokenized.get_splits(
+            tk::OffsetReferential::Original,
+            tk::OffsetType::Byte,
+        );
+        for (word, _, _) in splits {
+            if !word.is_empty() {
+                *word_counts.entry(CompactString::from(word)).or_default() += 1;
+            }
+        }
+    } else {
+        let word = normalized_text.trim();
+        if !word.is_empty() {
+            *word_counts.entry(CompactString::from(word)).or_default() += 1;
+        }
+    }
+    Ok(())
+}
+
 fn pre_tokenize_file(
     path: &str,
     normalizer: Option<&PyNormalizer>,
@@ -911,42 +953,64 @@ fn pre_tokenize_file(
 
     for line in reader.lines() {
         let line = line.map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
+        pre_tokenize_text(&line, normalizer, pre_tokenizer, &mut word_counts)?;
+    }
+    Ok(word_counts)
+}
 
-        // Normalize (mirrors tokenizer/mod.rs:1408-1410)
-        let normalized_text = if let Some(norm) = normalizer {
-            let mut normalized = tk::NormalizedString::from(line.as_str());
-            norm.normalize(&mut normalized)
-                .map_err(|e| exceptions::PyValueError::new_err(format!("Normalization error: {}", e)))?;
-            normalized.get().to_string()
-        } else {
-            line
-        };
+fn pre_tokenize_parquet_file(
+    path: &str,
+    text_column: &str,
+    normalizer: Option<&PyNormalizer>,
+    pre_tokenizer: Option<&PyPreTokenizer>,
+) -> PyResult<AHashMap<CompactString, u64>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-        // Pre-tokenize (mirrors tokenizer/mod.rs:1411-1416)
-        if let Some(pretok) = pre_tokenizer {
-            let mut pretokenized = tk::PreTokenizedString::from(normalized_text.as_str());
-            pretok
-                .pre_tokenize(&mut pretokenized)
-                .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
+    let file = File::open(path)
+        .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| exceptions::PyValueError::new_err(format!("Failed to create parquet reader for {}: {}", path, e)))?;
+    let reader = builder.build()
+        .map_err(|e| exceptions::PyValueError::new_err(format!("Failed to build parquet reader for {}: {}", path, e)))?;
+    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
 
-            let splits = pretokenized.get_splits(
-                tk::OffsetReferential::Original,
-                tk::OffsetType::Byte,
-            );
-            for (word, _, _) in splits {
-                if !word.is_empty() {
-                    *word_counts.entry(CompactString::from(word)).or_default() += 1;
-                }
+    for batch in reader {
+        let batch = batch
+            .map_err(|e| exceptions::PyIOError::new_err(format!("Failed to read batch from {}: {}", path, e)))?;
+        let col = batch.column_by_name(text_column).ok_or_else(|| {
+            exceptions::PyValueError::new_err(format!("Column '{}' not found in {}", text_column, path))
+        })?;
+
+        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+            for i in 0..arr.len() {
+                if arr.is_null(i) { continue; }
+                pre_tokenize_text(arr.value(i), normalizer, pre_tokenizer, &mut word_counts)?;
+            }
+        } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+            for i in 0..arr.len() {
+                if arr.is_null(i) { continue; }
+                pre_tokenize_text(arr.value(i), normalizer, pre_tokenizer, &mut word_counts)?;
             }
         } else {
-            // No pre-tokenizer: treat whole line as one word
-            let word = normalized_text.trim();
-            if !word.is_empty() {
-                *word_counts.entry(CompactString::from(word)).or_default() += 1;
-            }
+            return Err(exceptions::PyValueError::new_err(
+                format!("Column '{}' in {} is not a string type", text_column, path)
+            ));
         }
     }
     Ok(word_counts)
+}
+
+fn pre_tokenize_auto(
+    path: &str,
+    text_column: &str,
+    normalizer: Option<&PyNormalizer>,
+    pre_tokenizer: Option<&PyPreTokenizer>,
+) -> PyResult<AHashMap<CompactString, u64>> {
+    if path.ends_with(".parquet") {
+        pre_tokenize_parquet_file(path, text_column, normalizer, pre_tokenizer)
+    } else {
+        pre_tokenize_file(path, normalizer, pre_tokenizer)
+    }
 }
 
 /// Trainer for parity-aware BPE that ensures cross-lingual fairness in tokenization.
@@ -1066,20 +1130,17 @@ impl PyParityBpeTrainer {
     ///
     ///     output (:obj:`str`, `optional`):
     ///         Path to write merge rules to a file.
-    #[pyo3(signature = (tokenizer, train_files, dev_files = None, ratio = None, output = None))]
+    #[pyo3(signature = (tokenizer, train_files = None, dev_files = None, ratio = None, output = None, config = None))]
     fn train(
         &self,
         tokenizer: &mut PyTokenizer,
-        train_files: Vec<String>,
+        train_files: Option<Vec<String>>,
         dev_files: Option<Vec<String>>,
         ratio: Option<Vec<f64>>,
         output: Option<String>,
+        config: Option<String>,
     ) -> PyResult<()> {
-        use tk::models::bpe::{ParityBpeTrainer as RustTrainer, ParityVariant, BPE};
-
-        if train_files.is_empty() {
-            return Err(exceptions::PyValueError::new_err("train_files must not be empty"));
-        }
+        use tk::models::bpe::{ParityBpeTrainer as RustTrainer, ParityVariant, TrainingConfig, BPE};
 
         let parity_variant = match self.variant.as_str() {
             "base" => ParityVariant::Base,
@@ -1091,60 +1152,127 @@ impl PyParityBpeTrainer {
         let normalizer = tokenizer.tokenizer.get_normalizer().cloned();
         let pre_tokenizer = tokenizer.tokenizer.get_pre_tokenizer().cloned();
 
-        // Use ratio from train() arg, fall back to constructor arg
-        let effective_ratio = ratio.or_else(|| self.ratio.clone());
+        if let Some(ref cfg_path) = config {
+            // Config-driven training
+            let training_config = TrainingConfig::from_file(cfg_path)
+                .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot load config {}: {}", cfg_path, e)))?;
 
-        let mut builder = RustTrainer::builder()
-            .min_frequency(self.min_frequency)
-            .num_merges(self.num_merges)
-            .show_progress(true)
-            .variant(parity_variant)
-            .global_merges(self.global_merges)
-            .window_size(self.window_size)
-            .alpha(self.alpha)
-            .total_symbols(self.total_symbols);
+            let config_ratios = training_config.ratios();
 
-        if let Some(r) = effective_ratio {
-            builder = builder.ratio(r);
-        }
+            let builder = RustTrainer::builder()
+                .min_frequency(self.min_frequency)
+                .num_merges(self.num_merges)
+                .show_progress(true)
+                .variant(parity_variant)
+                .global_merges(self.global_merges)
+                .window_size(self.window_size)
+                .alpha(self.alpha)
+                .total_symbols(self.total_symbols)
+                .ratio(config_ratios);
+            let mut trainer = builder.build();
 
-        let mut trainer = builder.build();
+            for (lang_idx, lang_cfg) in training_config.languages.iter().enumerate() {
+                let mut merged_counts: AHashMap<CompactString, u64> = AHashMap::new();
+                for file_path in &lang_cfg.input {
+                    let file_counts = pre_tokenize_auto(
+                        file_path,
+                        &lang_cfg.text_column,
+                        normalizer.as_ref(),
+                        pre_tokenizer.as_ref(),
+                    )?;
+                    for (word, count) in file_counts {
+                        *merged_counts.entry(word).or_default() += count;
+                    }
+                }
+                trainer.feed_language(lang_idx, merged_counts);
+            }
 
-        // Feed training data
-        for (lang, path) in train_files.iter().enumerate() {
-            let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
-            trainer.feed_language(lang, word_counts);
-        }
+            // Train
+            let mut model = BPE::default();
+            let (special_tokens, merge_strings) = trainer
+                .do_train(&mut model)
+                .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Training error: {}", e)))?;
 
-        // Feed dev data
-        if let Some(ref dev) = dev_files {
-            for (lang, path) in dev.iter().enumerate() {
+            // Write output file if requested
+            if let Some(ref out_path) = output {
+                use std::io::Write;
+                let mut out = File::create(out_path)
+                    .map_err(|e| exceptions::PyIOError::new_err(format!("Cannot create {}: {}", out_path, e)))?;
+                writeln!(out, "#version: 0.2").map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+                for merge_line in &merge_strings {
+                    writeln!(out, "{}", merge_line).map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+                }
+            }
+
+            // Set the trained model on the tokenizer in-place
+            let py_model: PyModel = model.into();
+            tokenizer.tokenizer.with_model(py_model);
+            tokenizer.tokenizer.add_special_tokens(&special_tokens);
+        } else {
+            // Original file-per-language mode
+            let train_files = train_files.ok_or_else(|| {
+                exceptions::PyValueError::new_err("Either 'train_files' or 'config' must be provided")
+            })?;
+
+            if train_files.is_empty() {
+                return Err(exceptions::PyValueError::new_err("train_files must not be empty"));
+            }
+
+            // Use ratio from train() arg, fall back to constructor arg
+            let effective_ratio = ratio.or_else(|| self.ratio.clone());
+
+            let mut builder = RustTrainer::builder()
+                .min_frequency(self.min_frequency)
+                .num_merges(self.num_merges)
+                .show_progress(true)
+                .variant(parity_variant)
+                .global_merges(self.global_merges)
+                .window_size(self.window_size)
+                .alpha(self.alpha)
+                .total_symbols(self.total_symbols);
+
+            if let Some(r) = effective_ratio {
+                builder = builder.ratio(r);
+            }
+
+            let mut trainer = builder.build();
+
+            // Feed training data
+            for (lang, path) in train_files.iter().enumerate() {
                 let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
-                trainer.feed_dev_language(lang, word_counts);
+                trainer.feed_language(lang, word_counts);
             }
-        }
 
-        // Train — do_train populates model.vocab, model.vocab_r, and model.merges
-        let mut model = BPE::default();
-        let (special_tokens, merge_strings) = trainer
-            .do_train(&mut model)
-            .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Training error: {}", e)))?;
-
-        // Write output file if requested
-        if let Some(ref out_path) = output {
-            use std::io::Write;
-            let mut out = File::create(out_path)
-                .map_err(|e| exceptions::PyIOError::new_err(format!("Cannot create {}: {}", out_path, e)))?;
-            writeln!(out, "#version: 0.2").map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
-            for merge_line in &merge_strings {
-                writeln!(out, "{}", merge_line).map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+            // Feed dev data
+            if let Some(ref dev) = dev_files {
+                for (lang, path) in dev.iter().enumerate() {
+                    let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
+                    trainer.feed_dev_language(lang, word_counts);
+                }
             }
-        }
 
-        // Set the trained model on the tokenizer in-place
-        let py_model: PyModel = model.into();
-        tokenizer.tokenizer.with_model(py_model);
-        tokenizer.tokenizer.add_special_tokens(&special_tokens);
+            // Train
+            let mut model = BPE::default();
+            let (special_tokens, merge_strings) = trainer
+                .do_train(&mut model)
+                .map_err(|e| exceptions::PyRuntimeError::new_err(format!("Training error: {}", e)))?;
+
+            // Write output file if requested
+            if let Some(ref out_path) = output {
+                use std::io::Write;
+                let mut out = File::create(out_path)
+                    .map_err(|e| exceptions::PyIOError::new_err(format!("Cannot create {}: {}", out_path, e)))?;
+                writeln!(out, "#version: 0.2").map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+                for merge_line in &merge_strings {
+                    writeln!(out, "{}", merge_line).map_err(|e| exceptions::PyIOError::new_err(e.to_string()))?;
+                }
+            }
+
+            // Set the trained model on the tokenizer in-place
+            let py_model: PyModel = model.into();
+            tokenizer.tokenizer.with_model(py_model);
+            tokenizer.tokenizer.add_special_tokens(&special_tokens);
+        }
 
         Ok(())
     }

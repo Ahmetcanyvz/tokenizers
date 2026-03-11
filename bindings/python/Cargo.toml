@@ -24,9 +24,12 @@ itertools = "0.14"
 ahash = { version = "0.8.11", features = ["serde"] }
 pyo3-ffi = "0.28.2"
 compact_str = "0.9"
+parquet = { version = "55", default-features = false, features = ["arrow"] }
+arrow = { version = "55", default-features = false }
 
 [dependencies.tokenizers]
 path = "../../tokenizers"
+features = ["parquet"]
 
 [dev-dependencies]
 tempfile = "3.10"

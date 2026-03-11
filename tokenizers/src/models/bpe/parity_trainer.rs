@@ -1509,4 +1509,165 @@ mod tests {
             "'cd' should NOT be in vocab (pair freq 3 < min_frequency 5)"
         );
     }
+
+    #[test]
+    fn test_ratio_base_favors_high_ratio_language() {
+        // Lang 0: "aabb" x10, ratio=1.0; Lang 1: "ccdd" x10, ratio=2.0
+        // Lang 1 needs more compression → gets lower adjusted value → selected first
+        // adjusted = [(init/cur)/ratio_i]: initially [1.0, 0.5], lang 1 wins.
+        // After 2 merges on lang 1 (c c, d d): adjusted ties at [1.0, 1.0] → lang 0.
+        // Then lang 1 finishes with "cc dd".
+        let lang0: AHashMap<CompactString, u64> = [("aabb".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("ccdd".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(4)
+            .variant(ParityVariant::Base)
+            .ratio(vec![1.0, 2.0])
+            .build();
+
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+
+        assert_eq!(
+            merge_strings,
+            vec!["c c", "d d", "a a", "cc dd"],
+            "high-ratio language should be selected first"
+        );
+    }
+
+    #[test]
+    fn test_ratio_equal_ratios_matches_no_ratio_symmetric() {
+        // Symmetric data: both langs "aabb" x10, ratio=[1.0, 1.0].
+        // With equal ratios and equal initial lengths, ratio mode should produce
+        // the same merge order as no-ratio mode.
+        let make_data = || {
+            let lang0: AHashMap<CompactString, u64> =
+                [("aabb".into(), 10u64)].iter().cloned().collect();
+            let lang1: AHashMap<CompactString, u64> =
+                [("ccdd".into(), 10u64)].iter().cloned().collect();
+            (lang0, lang1)
+        };
+
+        // No-ratio mode
+        let (lang0, lang1) = make_data();
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(6)
+            .variant(ParityVariant::Base)
+            .build();
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+        let mut model = BPE::default();
+        let (_special, no_ratio_merges) = trainer.do_train(&mut model).unwrap();
+
+        // Ratio mode with equal ratios
+        let (lang0, lang1) = make_data();
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(6)
+            .variant(ParityVariant::Base)
+            .ratio(vec![1.0, 1.0])
+            .build();
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+        let mut model = BPE::default();
+        let (_special, ratio_merges) = trainer.do_train(&mut model).unwrap();
+
+        assert_eq!(
+            no_ratio_merges, ratio_merges,
+            "equal ratios with symmetric data should match no-ratio mode"
+        );
+    }
+
+    #[test]
+    fn test_ratio_asymmetric_data_compensated_by_ratio() {
+        // Lang 0: "ab" x100 (ratio=1.0), Lang 1: "cd" x10 (ratio=0.5)
+        // Despite lang 1 having much less data, its low ratio means it's "already ahead".
+        // adjusted[0] = (200/200)/1.0 = 1.0, adjusted[1] = (20/20)/0.5 = 2.0
+        // → lang 0 selected first.
+        let lang0: AHashMap<CompactString, u64> = [("ab".into(), 100u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("cd".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(2)
+            .variant(ParityVariant::Base)
+            .ratio(vec![1.0, 0.5])
+            .build();
+
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+
+        assert_eq!(
+            merge_strings,
+            vec!["a b", "c d"],
+            "lang 0 should go first despite smaller lang 1 data because ratio=0.5 marks lang 1 as ahead"
+        );
+    }
+
+    #[test]
+    fn test_ratio_window_variant() {
+        // Lang 0: "aabb" x10 (ratio=1.0), Lang 1: "ccdd" x10 (ratio=3.0)
+        // window_size=2, alpha=1.0. threshold = 1.0/2 = 0.5.
+        // Lang 1 dominates initial selections (lower adjusted), but after 2 picks
+        // its window ratio = 2/2 = 1.0 > 0.5 → masked, forcing lang 0 at merge 3.
+        let lang0: AHashMap<CompactString, u64> = [("aabb".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+        let lang1: AHashMap<CompactString, u64> = [("ccdd".into(), 10u64)]
+            .iter()
+            .cloned()
+            .collect();
+
+        let mut trainer = ParityBpeTrainer::builder()
+            .show_progress(false)
+            .min_frequency(1)
+            .num_merges(4)
+            .variant(ParityVariant::Window)
+            .window_size(2)
+            .alpha(1.0)
+            .ratio(vec![1.0, 3.0])
+            .build();
+
+        trainer.feed_language(0, lang0);
+        trainer.feed_language(1, lang1);
+
+        let mut model = BPE::default();
+        let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
+
+        // Merge 1-2: lang 1 (lower adjusted). Merge 3: window masks lang 1, forces lang 0.
+        // Merge 4: lang 1 unmasked, finishes with "cc dd".
+        assert_eq!(
+            merge_strings,
+            vec!["c c", "d d", "a a", "cc dd"],
+            "window should force lang 0 at merge 3 despite lang 1 having lower adjusted value"
+        );
+        // Verify the window masking actually mattered: merge 3 is from lang 0
+        assert_eq!(merge_strings[2], "a a", "merge 3 should be from lang 0 due to window masking");
+    }
 }
