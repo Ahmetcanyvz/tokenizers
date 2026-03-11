@@ -6,8 +6,35 @@ use crate::tokenizer::{AddedToken, Result, Trainer};
 use crate::utils::progress::{ProgressBar, ProgressStyle};
 use ahash::{AHashMap, AHashSet};
 use compact_str::CompactString;
+use dary_heap::OctonaryHeap;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
+
+#[derive(Debug, Eq)]
+struct PairMerge {
+    pair: Pair,
+    count: u64,
+}
+impl PartialEq for PairMerge {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count && self.pair == other.pair
+    }
+}
+impl PartialOrd for PairMerge {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PairMerge {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.count != other.count {
+            self.count.cmp(&other.count)
+        } else {
+            other.pair.cmp(&self.pair)
+        }
+    }
+}
 
 /// Parity selection variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +533,28 @@ impl ParityBpeTrainer {
         }
     }
 
+    /// Pop the best pair from a priority queue, lazily discarding stale entries.
+    fn pop_best_pair(
+        queue: &mut OctonaryHeap<PairMerge>,
+        pair_counts: &AHashMap<Pair, i64>,
+    ) -> Option<(Pair, u64)> {
+        loop {
+            let top = queue.pop()?;
+            let current_count = pair_counts.get(&top.pair).copied().unwrap_or(0);
+            if current_count <= 0 {
+                continue;
+            }
+            if top.count != current_count as u64 {
+                queue.push(PairMerge {
+                    pair: top.pair,
+                    count: current_count as u64,
+                });
+                continue;
+            }
+            return Some((top.pair, top.count));
+        }
+    }
+
     /// Find the best pair for a language using linear scan with string-based
     /// tie-breaking to match Python's `max(stats, key=lambda x: (stats[x][lang], x))`.
     fn find_best_pair_linear(
@@ -651,6 +700,23 @@ impl ParityBpeTrainer {
             let (pc, wtu) = self.count_pairs(&per_lang_words[lang], &per_lang_counts[lang]);
             per_lang_pair_counts.push(pc);
             per_lang_where.push(wtu);
+        }
+
+        // 4b. Build per-language priority queues
+        let mut per_lang_queues: Vec<OctonaryHeap<PairMerge>> =
+            Vec::with_capacity(num_langs);
+        for lang in 0..num_langs {
+            let mut queue =
+                OctonaryHeap::with_capacity(per_lang_pair_counts[lang].len());
+            for (&pair, &count) in &per_lang_pair_counts[lang] {
+                if count > 0 {
+                    queue.push(PairMerge {
+                        pair,
+                        count: count as u64,
+                    });
+                }
+            }
+            per_lang_queues.push(queue);
         }
 
         // 5. Build dev vocab and compute initial lengths
@@ -865,11 +931,14 @@ impl ParityBpeTrainer {
                 }
             };
 
-            // Find the best pair using linear scan with string tie-breaking
+            // Find the best pair
             let best_pair = if lang_idx == usize::MAX {
                 self.find_best_pair_global_linear(&per_lang_pair_counts, &id_to_word)
             } else {
-                self.find_best_pair_linear(&per_lang_pair_counts[lang_idx], &id_to_word)
+                Self::pop_best_pair(
+                    &mut per_lang_queues[lang_idx],
+                    &per_lang_pair_counts[lang_idx],
+                )
             };
 
             let (best_pair, _best_count) = match best_pair {
@@ -909,7 +978,7 @@ impl ParityBpeTrainer {
 
             // Apply merge to ALL languages' training words and update pair counts
             for lang in 0..num_langs {
-                let train_length_change = self.apply_merge_to_language(
+                let (train_length_change, changed_pairs) = self.apply_merge_to_language(
                     best_pair,
                     new_token_id,
                     max_token_length,
@@ -918,6 +987,21 @@ impl ParityBpeTrainer {
                     &mut per_lang_pair_counts[lang],
                     &mut per_lang_where[lang],
                 );
+
+                // Push changed pairs into this language's heap
+                for changed_pair in changed_pairs {
+                    let count = per_lang_pair_counts[lang]
+                        .get(&changed_pair)
+                        .copied()
+                        .unwrap_or(0);
+                    if count > 0 {
+                        per_lang_queues[lang].push(PairMerge {
+                            pair: changed_pair,
+                            count: count as u64,
+                        });
+                    }
+                }
+
                 if has_ratio {
                     // Ratio mode: update lengths from training data changes
                     lengths_f64[lang] -= train_length_change as f64;
@@ -986,7 +1070,7 @@ impl ParityBpeTrainer {
     }
 
     /// Apply a merge to one language's words, update pair counts.
-    /// Returns the total length reduction (sum of count * reduction per word).
+    /// Returns (length_reduction, changed_pairs) for heap updates.
     fn apply_merge_to_language(
         &self,
         pair: Pair,
@@ -996,38 +1080,55 @@ impl ParityBpeTrainer {
         counts: &[u64],
         pair_counts: &mut AHashMap<Pair, i64>,
         where_to_update: &mut AHashMap<Pair, AHashSet<usize>>,
-    ) -> i64 {
-        let mut length_reduction: i64 = 0;
-
-        // Get positions where this pair appears
+    ) -> (i64, Vec<Pair>) {
         let positions = match where_to_update.remove(&pair) {
             Some(pos) => pos,
-            None => return 0,
+            None => return (0, Vec::new()),
         };
 
-        for &i in &positions {
-            let old_len = words[i].get_chars().len() as i64;
-            let changes = words[i].merge(pair.0, pair.1, new_token_id, max_token_length);
-            let new_len = words[i].get_chars().len() as i64;
+        // --- Parallel phase: merge words at each position ---
+        // Safety: same pattern as standard BPE (trainer.rs:521-544).
+        // Each position appears at most once (AHashSet), so no two threads
+        // mutate the same Word.
+        let words_len = words.len();
+        struct WordPtr(*mut Word);
+        unsafe impl Sync for WordPtr {}
+        let word_start = WordPtr(words.as_mut_ptr());
 
-            length_reduction += (old_len - new_len) * counts[i] as i64;
+        let changes: Vec<(Vec<(Pair, i32)>, usize, i64)> = positions
+            .maybe_par_iter()
+            .map(|&i| unsafe {
+                assert!(i < words_len);
+                let word = word_start.0.add(i);
+                let old_len = (*word).get_chars().len() as i64;
+                let merge_changes =
+                    (*word).merge(pair.0, pair.1, new_token_id, max_token_length);
+                let new_len = (*word).get_chars().len() as i64;
+                let reduction = (old_len - new_len) * counts[i] as i64;
+                (merge_changes, i, reduction)
+            })
+            .collect();
 
-            // Update pair counts and where_to_update
-            for (change_pair, change) in changes {
-                *pair_counts.entry(change_pair).or_default() += change as i64 * counts[i] as i64;
+        // --- Sequential phase: apply changes to pair_counts + where_to_update ---
+        let mut length_reduction: i64 = 0;
+        let mut changed_pairs = Vec::new();
+        for (merge_changes, iw, reduction) in changes {
+            length_reduction += reduction;
+            for (change_pair, change) in merge_changes {
+                let count = change as i64 * counts[iw] as i64;
+                *pair_counts.entry(change_pair).or_default() += count;
                 if change > 0 {
                     where_to_update
                         .entry(change_pair)
                         .or_default()
-                        .insert(i);
+                        .insert(iw);
                 }
+                changed_pairs.push(change_pair);
             }
         }
 
-        // Zero out the merged pair's count
         pair_counts.insert(pair, 0);
-
-        length_reduction
+        (length_reduction, changed_pairs)
     }
 }
 
@@ -1107,13 +1208,13 @@ mod tests {
         let mut model = BPE::default();
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
-        // Languages are tied in length, so either could go first.
-        // If lang 0 first: b b, d d, a bb, c dd, a abb, c cdd
-        // If lang 1 first: d d, b b, c dd, a bb, c cdd, a abb
-        let lang0_first = vec!["b b", "d d", "a bb", "c dd", "a abb", "c cdd"];
-        let lang1_first = vec!["d d", "b b", "c dd", "a bb", "c cdd", "a abb"];
-        assert!(
-            merge_strings == lang0_first || merge_strings == lang1_first,
+        // Languages are tied in length, so lang 0 goes first (lower index wins ties).
+        // ID-based tie-breaking: lower pair ID wins.
+        // Chars: a(0), b(1), c(2), d(3). Pairs with same count → lowest ID wins.
+        // Lang 0 first: a a, then lang 1: c c, then lang 0: b b, etc.
+        assert_eq!(
+            merge_strings,
+            vec!["a a", "c c", "b b", "d d", "aa bb", "cc dd"],
             "expected alternating merges; got {:?}",
             merge_strings
         );
@@ -1204,10 +1305,11 @@ mod tests {
         trainer.feed_language(1, lang1.clone());
         let mut model = BPE::default();
         let (_special, base_merges) = trainer.do_train(&mut model).unwrap();
-        // Base: lang 0 always longest, takes all 3 merges before lang 1 gets any
+        // Base: lang 0 always longest, takes all 3 merges before lang 1 gets any.
+        // ID-based tie-breaking: a a (lowest pair ID) before b b.
         assert_eq!(
             base_merges,
-            vec!["b b", "a bb", "a abb", "d d", "c dd", "c cdd"],
+            vec!["a a", "b b", "aa bb", "c c", "d d", "cc dd"],
             "Base should let lang 0 monopolize merges"
         );
 
@@ -1225,10 +1327,10 @@ mod tests {
         let mut model = BPE::default();
         let (_special, window_merges) = trainer.do_train(&mut model).unwrap();
         // Window: after 2 consecutive lang 0 picks, ratio=2/2=1.0 > 0.5 threshold,
-        // so lang 0 is masked and lang 1 gets "d d" at step 3 instead of step 4.
+        // so lang 0 is masked and lang 1 gets "c c" at step 3 instead of step 4.
         assert_eq!(
             window_merges,
-            vec!["b b", "a bb", "d d", "a abb", "c dd", "c cdd"],
+            vec!["a a", "b b", "c c", "aa bb", "d d", "cc dd"],
             "Window should force lang 1's first merge earlier than Base"
         );
         // Key difference: lang 1's first merge is at index 2 (Window) vs 3 (Base)
@@ -1266,17 +1368,18 @@ mod tests {
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
         // Lang 1 selected first (longer: 4*10=40 vs 2*10=20)
-        // 'e' + 'f' -> 'ef' (lang 1, length now 3*10=30)
+        // ID-based tie-breaking: (2,3)="c d" wins over (3,4) and (4,5)
+        // 'c' + 'd' -> 'cd' (lang 1, length now 3*10=30)
         // Lang 1 still longer (30 vs 20), selected again:
-        // 'd' + 'ef' -> 'def' (lang 1, length now 2*10=20)
+        // 'e' + 'f' -> 'ef' (lang 1, length now 2*10=20)
         // Tied at 20, lang 0 wins by index:
         // 'a' + 'b' -> 'ab' (lang 0, now exhausted)
         // Lang 0 exhausted, skip to lang 1:
-        // 'c' + 'def' -> 'cdef' (lang 1)
+        // 'cd' + 'ef' -> 'cdef' (lang 1)
         // Only 4 merges possible despite requesting 10
         assert_eq!(
             merge_strings,
-            vec!["e f", "d ef", "a b", "c def"],
+            vec!["c d", "e f", "a b", "cd ef"],
             "should produce exactly 4 merges; exhausted lang 0 skipped"
         );
     }
