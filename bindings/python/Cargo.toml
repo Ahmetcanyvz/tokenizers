@@ -23,7 +23,7 @@ ndarray = "0.16"
 itertools = "0.14"
 ahash = { version = "0.8.11", features = ["serde"] }
 compact_str = "0.9"
-parquet = { version = "55", default-features = false, features = ["arrow"] }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
 arrow = { version = "55", default-features = false }
 
 [dependencies.tokenizers]
