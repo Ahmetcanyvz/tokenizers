@@ -7,8 +7,8 @@ Paper: ["Parity-Aware Byte-Pair Encoding: Improving Cross-lingual Fairness in To
 ## Installation
 
 ```bash
-git clone https://github.com/swiss-ai/parity-aware-bpe.git
-cd parity-aware-bpe/tokenizers/bindings/python
+git clone -b parity-aware-bpe https://github.com/Ahmetcanyvz/tokenizers.git
+cd tokenizers/bindings/python
 pip install -e .
 ```
 
@@ -89,6 +89,72 @@ cargo build --release --bin parity_bpe_train
 | `--min-frequency` | Minimum pair frequency (default: 2) |
 | `--window-size` | Window size for `window` variant (default: 100) |
 | `--alpha` | Alpha for `window` variant (default: 2.0) |
+
+## Training Script
+
+`train_tokenizer.py` is a unified training script that supports both standard BPE and parity-aware BPE. It takes a data config (`--data-config`) in the same JSON format used for per-language training, and an optional tokenizer component config (`--tokenizer-config`) to specify the pretokenizer, decoder, etc. When no `--tokenizer-config` is provided, the default is a ByteLevel pretokenizer and ByteLevel decoder.
+
+### Standard BPE
+
+```bash
+python train_tokenizer.py \
+    --trainer bpe \
+    --data-config pa_config.json \
+    --vocab-size 64000 \
+    --min-frequency 2 \
+    --special-tokens "<s>" "</s>" "<pad>" "<unk>" \
+    --output tokenizer_bpe.json
+```
+
+### Parity-Aware BPE
+
+```bash
+python train_tokenizer.py \
+    --trainer parity-bpe \
+    --data-config pa_config.json \
+    --vocab-size 128000 \
+    --variant base \
+    --output tokenizer_parity.json
+```
+
+### Parity-Aware BPE with Window Variant
+
+```bash
+python train_tokenizer.py \
+    --trainer parity-bpe \
+    --data-config pa_config.json \
+    --vocab-size 128000 \
+    --variant window \
+    --window-size 100 \
+    --alpha 2.0 \
+    --output tokenizer_parity_window.json
+```
+
+### Custom Pretokenizer
+
+To override the default ByteLevel pretokenizer, pass a `--tokenizer-config` JSON file in HF tokenizer format:
+
+```json
+{
+  "pre_tokenizer": {
+    "type": "Sequence",
+    "pretokenizers": [
+      {"type": "Whitespace"},
+      {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": false}
+    ]
+  },
+  "decoder": {"type": "ByteLevel"}
+}
+```
+
+```bash
+python train_tokenizer.py \
+    --trainer parity-bpe \
+    --data-config pa_config.json \
+    --tokenizer-config components.json \
+    --vocab-size 128000 \
+    --output tokenizer_custom.json
+```
 
 ## Algorithm Variants
 
