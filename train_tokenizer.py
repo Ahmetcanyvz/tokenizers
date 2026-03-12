@@ -7,7 +7,7 @@ import os
 import tempfile
 
 import pyarrow.parquet as pq
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer, pre_tokenizers, decoders
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer, ParityBpeTrainer
 
@@ -34,7 +34,12 @@ def build_tokenizer(tokenizer_config_path):
     component types, then extracts the deserialized components.
     """
     if tokenizer_config_path is None:
-        return Tokenizer(BPE())
+        tokenizer = Tokenizer(BPE())
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
+            add_prefix_space=False, trim_offsets=True, use_regex=True
+        )
+        tokenizer.decoder = decoders.ByteLevel()
+        return tokenizer
 
     with open(tokenizer_config_path) as f:
         components = json.load(f)
