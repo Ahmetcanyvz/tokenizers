@@ -15,6 +15,8 @@ use std::collections::{HashSet, VecDeque};
 struct PairMerge {
     pair: Pair,
     count: u64,
+    /// String representations for tie-breaking (matches Python's string comparison)
+    str_key: (CompactString, CompactString),
 }
 impl PartialEq for PairMerge {
     fn eq(&self, other: &Self) -> bool {
@@ -31,7 +33,8 @@ impl Ord for PairMerge {
         if self.count != other.count {
             self.count.cmp(&other.count)
         } else {
-            other.pair.cmp(&self.pair)
+            // String-based tie-breaking to match Python's max(stats, key=lambda x: (stats[x][lang], x))
+            self.str_key.cmp(&other.str_key)
         }
     }
 }
@@ -537,6 +540,7 @@ impl ParityBpeTrainer {
     fn pop_best_pair(
         queue: &mut OctonaryHeap<PairMerge>,
         pair_counts: &AHashMap<Pair, i64>,
+        _id_to_word: &[CompactString],
     ) -> Option<(Pair, u64)> {
         loop {
             let top = queue.pop()?;
@@ -548,6 +552,7 @@ impl ParityBpeTrainer {
                 queue.push(PairMerge {
                     pair: top.pair,
                     count: current_count as u64,
+                    str_key: top.str_key,
                 });
                 continue;
             }
@@ -713,6 +718,10 @@ impl ParityBpeTrainer {
                     queue.push(PairMerge {
                         pair,
                         count: count as u64,
+                        str_key: (
+                            id_to_word[pair.0 as usize].clone(),
+                            id_to_word[pair.1 as usize].clone(),
+                        ),
                     });
                 }
             }
@@ -938,6 +947,7 @@ impl ParityBpeTrainer {
                 Self::pop_best_pair(
                     &mut per_lang_queues[lang_idx],
                     &per_lang_pair_counts[lang_idx],
+                    &id_to_word,
                 )
             };
 
@@ -998,6 +1008,10 @@ impl ParityBpeTrainer {
                         per_lang_queues[lang].push(PairMerge {
                             pair: changed_pair,
                             count: count as u64,
+                            str_key: (
+                                id_to_word[changed_pair.0 as usize].clone(),
+                                id_to_word[changed_pair.1 as usize].clone(),
+                            ),
                         });
                     }
                 }
@@ -1209,12 +1223,12 @@ mod tests {
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
         // Languages are tied in length, so lang 0 goes first (lower index wins ties).
-        // ID-based tie-breaking: lower pair ID wins.
-        // Chars: a(0), b(1), c(2), d(3). Pairs with same count → lowest ID wins.
-        // Lang 0 first: a a, then lang 1: c c, then lang 0: b b, etc.
+        // String-based tie-breaking: pairs compared as string tuples.
+        // Lang 0: "b b" > "a a" alphabetically → "b b" first, then "a bb".
+        // Lang 1: "d d" > "c c" → "d d" first, then "c dd".
         assert_eq!(
             merge_strings,
-            vec!["a a", "c c", "b b", "d d", "aa bb", "cc dd"],
+            vec!["b b", "d d", "a bb", "c dd", "a abb", "c cdd"],
             "expected alternating merges; got {:?}",
             merge_strings
         );
@@ -1306,10 +1320,10 @@ mod tests {
         let mut model = BPE::default();
         let (_special, base_merges) = trainer.do_train(&mut model).unwrap();
         // Base: lang 0 always longest, takes all 3 merges before lang 1 gets any.
-        // ID-based tie-breaking: a a (lowest pair ID) before b b.
+        // String-based tie-breaking: "b b" > "a a", so "b b" first.
         assert_eq!(
             base_merges,
-            vec!["a a", "b b", "aa bb", "c c", "d d", "cc dd"],
+            vec!["b b", "a bb", "a abb", "d d", "c dd", "c cdd"],
             "Base should let lang 0 monopolize merges"
         );
 
@@ -1327,10 +1341,10 @@ mod tests {
         let mut model = BPE::default();
         let (_special, window_merges) = trainer.do_train(&mut model).unwrap();
         // Window: after 2 consecutive lang 0 picks, ratio=2/2=1.0 > 0.5 threshold,
-        // so lang 0 is masked and lang 1 gets "c c" at step 3 instead of step 4.
+        // so lang 0 is masked and lang 1 gets a turn at step 3 instead of step 4.
         assert_eq!(
             window_merges,
-            vec!["a a", "b b", "c c", "aa bb", "d d", "cc dd"],
+            vec!["b b", "a bb", "d d", "a abb", "c dd", "c cdd"],
             "Window should force lang 1's first merge earlier than Base"
         );
         // Key difference: lang 1's first merge is at index 2 (Window) vs 3 (Base)
@@ -1368,18 +1382,18 @@ mod tests {
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
         // Lang 1 selected first (longer: 4*10=40 vs 2*10=20)
-        // ID-based tie-breaking: (2,3)="c d" wins over (3,4) and (4,5)
-        // 'c' + 'd' -> 'cd' (lang 1, length now 3*10=30)
+        // String-based tie-breaking: "e f" > "d e" > "c d" alphabetically
+        // 'e' + 'f' -> 'ef' (lang 1, length now 3*10=30)
         // Lang 1 still longer (30 vs 20), selected again:
-        // 'e' + 'f' -> 'ef' (lang 1, length now 2*10=20)
+        // 'd' + 'ef' -> 'def' (lang 1, length now 2*10=20)
         // Tied at 20, lang 0 wins by index:
         // 'a' + 'b' -> 'ab' (lang 0, now exhausted)
         // Lang 0 exhausted, skip to lang 1:
-        // 'cd' + 'ef' -> 'cdef' (lang 1)
+        // 'c' + 'def' -> 'cdef' (lang 1)
         // Only 4 merges possible despite requesting 10
         assert_eq!(
             merge_strings,
-            vec!["c d", "e f", "a b", "cd ef"],
+            vec!["e f", "d ef", "a b", "c def"],
             "should produce exactly 4 merges; exhausted lang 0 skipped"
         );
     }
@@ -1542,7 +1556,7 @@ mod tests {
 
         assert_eq!(
             merge_strings,
-            vec!["c c", "d d", "a a", "cc dd"],
+            vec!["d d", "c dd", "b b", "c cdd"],
             "high-ratio language should be selected first"
         );
     }
@@ -1661,13 +1675,13 @@ mod tests {
         let (_special, merge_strings) = trainer.do_train(&mut model).unwrap();
 
         // Merge 1-2: lang 1 (lower adjusted). Merge 3: window masks lang 1, forces lang 0.
-        // Merge 4: lang 1 unmasked, finishes with "cc dd".
+        // Merge 4: lang 1 unmasked, finishes with "c cdd".
         assert_eq!(
             merge_strings,
-            vec!["c c", "d d", "a a", "cc dd"],
+            vec!["d d", "c dd", "b b", "c cdd"],
             "window should force lang 0 at merge 3 despite lang 1 having lower adjusted value"
         );
         // Verify the window masking actually mattered: merge 3 is from lang 0
-        assert_eq!(merge_strings[2], "a a", "merge 3 should be from lang 0 due to window masking");
+        assert_eq!(merge_strings[2], "b b", "merge 3 should be from lang 0 due to window masking");
     }
 }
