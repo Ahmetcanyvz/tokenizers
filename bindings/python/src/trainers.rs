@@ -948,11 +948,19 @@ fn pre_tokenize_file(
 ) -> PyResult<AHashMap<CompactString, u64>> {
     let file = File::open(path)
         .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
+    // Use read_line to preserve trailing newline, matching Python's `for line in fobj`
+    // which includes \n. This matters for ByteLevel pre-tokenizer where \n → Ċ.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)
+            .map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
+        if bytes_read == 0 {
+            break;
+        }
         pre_tokenize_text(&line, normalizer, pre_tokenizer, &mut word_counts)?;
     }
     Ok(word_counts)

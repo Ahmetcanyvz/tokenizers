@@ -32,11 +32,18 @@ fn pre_tokenize_text(
 
 fn pre_tokenize_file(path: &str, pre_tokenizer: &Sequence) -> AHashMap<CompactString, u64> {
     let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
 
-    for line in reader.lines() {
-        let line = line.expect("Failed to read line");
+    // Use read_line to preserve trailing newline, matching Python's `for line in fobj`
+    // which includes \n. This matters for ByteLevel pre-tokenizer where \n → Ċ.
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).expect("Failed to read line");
+        if bytes_read == 0 {
+            break;
+        }
         pre_tokenize_text(&line, pre_tokenizer, &mut word_counts);
     }
 
@@ -119,6 +126,7 @@ fn main() {
     let mut ratio: Option<Vec<f64>> = None;
     let mut total_symbols: bool = false;
     let mut config_path: Option<String> = None;
+    let mut pretokenize: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -191,6 +199,13 @@ fn main() {
                 total_symbols = true;
                 i += 1;
             }
+            "--pretokenize" => {
+                i += 1;
+                while i < args.len() && !args[i].starts_with('-') {
+                    pretokenize.push(args[i].clone());
+                    i += 1;
+                }
+            }
             "--config" | "-c" => {
                 i += 1;
                 config_path = Some(args[i].clone());
@@ -206,6 +221,7 @@ fn main() {
                 eprintln!("  --window-size N  --alpha F");
                 eprintln!("  --ratio <floats...>  (compression ratios per language, alternative to --dev)");
                 eprintln!("  --total-symbols  (subtract unique chars from --symbols)");
+                eprintln!("  --pretokenize <whitespace|bytelevel>...  (default: whitespace bytelevel)");
                 std::process::exit(0);
             }
             _ => {
@@ -215,11 +231,19 @@ fn main() {
         }
     }
 
-    // Build pre-tokenizer: Whitespace + ByteLevel(use_regex=False)
-    let pre_tokenizer = Sequence::new(vec![
-        PreTokenizerWrapper::Whitespace(Whitespace),
-        PreTokenizerWrapper::ByteLevel(ByteLevel::new(true, true, false)),
-    ]);
+    // Build pre-tokenizer from --pretokenize args (default: whitespace bytelevel)
+    if pretokenize.is_empty() {
+        pretokenize = vec!["whitespace".into(), "bytelevel".into()];
+    }
+    let mut pretok_parts: Vec<PreTokenizerWrapper> = Vec::new();
+    for p in &pretokenize {
+        match p.as_str() {
+            "whitespace" => pretok_parts.push(PreTokenizerWrapper::Whitespace(Whitespace)),
+            "bytelevel" => pretok_parts.push(PreTokenizerWrapper::ByteLevel(ByteLevel::new(true, true, false))),
+            _ => panic!("Unknown pretokenizer: {}. Use 'whitespace' or 'bytelevel'.", p),
+        }
+    }
+    let pre_tokenizer = Sequence::new(pretok_parts);
 
     let pretok_start = Instant::now();
 
