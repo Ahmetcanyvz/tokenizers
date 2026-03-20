@@ -4,6 +4,9 @@ use std::{iter, mem};
 mod model;
 pub mod parity_config;
 pub mod parity_trainer;
+/// Shared pre-tokenization utilities for parity-aware BPE.
+/// Not re-exported from the crate root; access via `models::bpe::parity_utils`.
+pub mod parity_utils;
 mod serialization;
 pub mod trainer;
 mod word;

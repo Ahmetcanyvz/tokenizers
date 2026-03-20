@@ -1,115 +1,15 @@
 use ahash::AHashMap;
-use arrow::array::Array;
 use compact_str::CompactString;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::time::Instant;
-use tokenizers::models::bpe::{ParityBpeTrainer, ParityVariant, TrainingConfig, BPE};
+use tokenizers::models::bpe::{
+    parity_utils, ParityBpeTrainer, ParityVariant, TrainingConfig, BPE,
+};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
-
-fn pre_tokenize_text(
-    text: &str,
-    pre_tokenizer: &Sequence,
-    word_counts: &mut AHashMap<CompactString, u64>,
-) {
-    for line in text.lines() {
-        let mut pretokenized = PreTokenizedString::from(line);
-        pre_tokenizer
-            .pre_tokenize(&mut pretokenized)
-            .expect("Pre-tokenization failed");
-        let splits = pretokenized.get_splits(OffsetReferential::Original, OffsetType::Byte);
-        for (word, _, _) in splits {
-            if !word.is_empty() {
-                *word_counts.entry(CompactString::from(word)).or_default() += 1;
-            }
-        }
-    }
-}
-
-fn pre_tokenize_file(path: &str, pre_tokenizer: &Sequence) -> AHashMap<CompactString, u64> {
-    let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
-    let mut reader = BufReader::new(file);
-    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
-
-    // Use read_line to preserve trailing newline, matching Python's `for line in fobj`
-    // which includes \n. This matters for ByteLevel pre-tokenizer where \n → Ċ.
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).expect("Failed to read line");
-        if bytes_read == 0 {
-            break;
-        }
-        pre_tokenize_text(&line, pre_tokenizer, &mut word_counts);
-    }
-
-    word_counts
-}
-
-fn pre_tokenize_parquet_file(
-    path: &str,
-    text_column: &str,
-    pre_tokenizer: &Sequence,
-) -> AHashMap<CompactString, u64> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(file).expect("Failed to create parquet reader");
-    let reader = builder.build().expect("Failed to build parquet reader");
-    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
-
-    for batch in reader {
-        let batch = batch.expect("Failed to read batch");
-        let col = batch
-            .column_by_name(text_column)
-            .unwrap_or_else(|| panic!("Column '{}' not found in {}", text_column, path));
-
-        if let Some(arr) = col
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-        {
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    continue;
-                }
-                pre_tokenize_text(arr.value(i), pre_tokenizer, &mut word_counts);
-            }
-        } else if let Some(arr) = col
-            .as_any()
-            .downcast_ref::<arrow::array::LargeStringArray>()
-        {
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    continue;
-                }
-                pre_tokenize_text(arr.value(i), pre_tokenizer, &mut word_counts);
-            }
-        } else {
-            panic!(
-                "Column '{}' in {} is not a string type",
-                text_column, path
-            );
-        }
-    }
-    word_counts
-}
-
-fn pre_tokenize_auto(
-    path: &str,
-    text_column: &str,
-    pre_tokenizer: &Sequence,
-) -> AHashMap<CompactString, u64> {
-    if path.ends_with(".parquet") {
-        pre_tokenize_parquet_file(path, text_column, pre_tokenizer)
-    } else {
-        pre_tokenize_file(path, pre_tokenizer)
-    }
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -226,7 +126,7 @@ fn main() {
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                i += 1;
+                std::process::exit(1);
             }
         }
     }
@@ -253,14 +153,14 @@ fn main() {
             .unwrap_or_else(|e| panic!("Cannot load config {}: {}", cfg_path, e));
 
         let num_langs = config.languages.len();
-        let config_ratios = config.ratios();
+        let has_dev = config.has_dev();
 
         eprintln!(
-            "Parity-aware BPE (Rust) | variant={:?} | languages={} (from config) | symbols={}",
-            variant, num_langs, num_symbols
+            "Parity-aware BPE (Rust) | variant={:?} | languages={} (from config) | symbols={} | dev={}",
+            variant, num_langs, num_symbols, has_dev
         );
 
-        let builder = ParityBpeTrainer::builder()
+        let mut builder = ParityBpeTrainer::builder()
             .min_frequency(min_frequency)
             .num_merges(num_symbols)
             .show_progress(true)
@@ -268,22 +168,45 @@ fn main() {
             .global_merges(global_merges)
             .window_size(window_size)
             .alpha(alpha)
-            .total_symbols(total_symbols)
-            .ratio(config_ratios);
+            .total_symbols(total_symbols);
+
+        // Only use ratios if no dev files are present in the config
+        if !has_dev {
+            builder = builder.ratio(config.ratios());
+        }
+
         let mut trainer = builder.build();
 
         eprintln!("Pre-tokenizing training files from config...");
         for (lang_idx, lang_cfg) in config.languages.iter().enumerate() {
-            eprintln!("  [{}] {} ({} files, ratio={})", lang_idx, lang_cfg.name, lang_cfg.input.len(), lang_cfg.ratio);
+            eprintln!("  [{}] {} ({} files, ratio={})", lang_idx, lang_cfg.name, lang_cfg.input.len(), lang_cfg.ratio.unwrap_or(1.0));
             let mut merged_counts: AHashMap<CompactString, u64> = AHashMap::new();
             for file_path in &lang_cfg.input {
-                let file_counts = pre_tokenize_auto(file_path, &lang_cfg.text_column, &pre_tokenizer);
+                let file_counts = parity_utils::pre_tokenize_auto(file_path, &lang_cfg.text_column, None, Some(&pre_tokenizer)).expect("Pre-tokenization failed");
                 for (word, count) in file_counts {
                     *merged_counts.entry(word).or_default() += count;
                 }
             }
             eprintln!("    {} unique words", merged_counts.len());
             trainer.feed_language(lang_idx, merged_counts);
+        }
+
+        // Feed dev data from config
+        if has_dev {
+            eprintln!("Pre-tokenizing dev files from config...");
+            for (lang_idx, lang_cfg) in config.languages.iter().enumerate() {
+                if let Some(ref dev_paths) = lang_cfg.dev {
+                    let mut dev_counts: AHashMap<CompactString, u64> = AHashMap::new();
+                    for file_path in dev_paths {
+                        let file_counts = parity_utils::pre_tokenize_auto(file_path, &lang_cfg.text_column, None, Some(&pre_tokenizer)).expect("Pre-tokenization failed");
+                        for (word, count) in file_counts {
+                            *dev_counts.entry(word).or_default() += count;
+                        }
+                    }
+                    eprintln!("    [{}] {} dev words", lang_idx, dev_counts.len());
+                    trainer.feed_dev_language(lang_idx, dev_counts);
+                }
+            }
         }
 
         eprintln!("Pre-tokenization took: {:.2?}", pretok_start.elapsed());
@@ -339,7 +262,7 @@ fn main() {
 
         for (lang, path) in train_files.iter().enumerate() {
             eprintln!("  [{}] {}", lang, path);
-            let word_counts = pre_tokenize_file(path, &pre_tokenizer);
+            let word_counts = parity_utils::pre_tokenize_file(path, None, Some(&pre_tokenizer)).expect("Pre-tokenization failed");
             eprintln!("    {} unique words", word_counts.len());
             trainer.feed_language(lang, word_counts);
         }
@@ -349,7 +272,7 @@ fn main() {
             eprintln!("Pre-tokenizing dev files...");
             for (lang, path) in dev_files.iter().enumerate() {
                 eprintln!("  [{}] {}", lang, path);
-                let word_counts = pre_tokenize_file(path, &pre_tokenizer);
+                let word_counts = parity_utils::pre_tokenize_file(path, None, Some(&pre_tokenizer)).expect("Pre-tokenization failed");
                 eprintln!("    {} unique words", word_counts.len());
                 trainer.feed_dev_language(lang, word_counts);
             }

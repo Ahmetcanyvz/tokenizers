@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3                                                                                                                                            
 """Unified BPE training script supporting both standard and parity-aware BPE."""
-
-import argparse
+                                                                                                                                                                  
+import argparse                                                                                                                                                   
 import json
 import os
 import tempfile
@@ -127,6 +127,7 @@ def train_parity_bpe(args):
         window_size=args.window_size,
         alpha=args.alpha,
         total_symbols=True,
+        special_tokens=args.special_tokens or [],
     )
 
     print(f"Training parity-aware BPE (vocab_size={args.vocab_size}, variant={args.variant}) ...")
@@ -177,6 +178,9 @@ def main():
                         help="Window size for window variant (default: 100)")
     parser.add_argument("--alpha", type=float, default=2.0,
                         help="Alpha for window variant (default: 2.0)")
+    parser.add_argument("--use-ratios", action="store_true", default=False,
+                        help="Use ratios from config instead of dev files for "
+                             "language selection")
 
     # Standard BPE specific
     parser.add_argument("--max-token-length", type=int, default=None,
@@ -188,11 +192,6 @@ def main():
         tokenizer = train_standard_bpe(args)
     else:
         tokenizer = train_parity_bpe(args)
-
-    # Add special tokens after training (for parity-bpe path where they
-    # can't be passed to the trainer directly)
-    if args.special_tokens and args.trainer == "parity-bpe":
-        tokenizer.add_special_tokens(args.special_tokens)
 
     tokenizer.save(args.output)
     print(f"Saved tokenizer to {args.output}")

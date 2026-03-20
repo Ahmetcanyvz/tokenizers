@@ -1,22 +1,16 @@
 use std::sync::{Arc, RwLock};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 
 use ahash::AHashMap;
-use arrow::array::Array;
 use compact_str::CompactString;
 
 use crate::models::PyModel;
-use crate::normalizers::PyNormalizer;
-use crate::pre_tokenizers::PyPreTokenizer;
 use crate::tokenizer::{PyAddedToken, PyTokenizer};
 use pyo3::exceptions;
 use pyo3::prelude::*;
 use pyo3::types::*;
 use serde::{Deserialize, Serialize};
 use tk::models::TrainerWrapper;
-use tk::Normalizer as NormalizerTrait;
-use tk::PreTokenizer as PreTokenizerTrait;
 use tk::Trainer;
 use tokenizers as tk;
 
@@ -900,125 +894,12 @@ impl PyUnigramTrainer {
     }
 }
 
-fn pre_tokenize_text(
-    text: &str,
-    normalizer: Option<&PyNormalizer>,
-    pre_tokenizer: Option<&PyPreTokenizer>,
-    word_counts: &mut AHashMap<CompactString, u64>,
-) -> PyResult<()> {
-    // Normalize
-    let normalized_text = if let Some(norm) = normalizer {
-        let mut normalized = tk::NormalizedString::from(text);
-        norm.normalize(&mut normalized)
-            .map_err(|e| exceptions::PyValueError::new_err(format!("Normalization error: {}", e)))?;
-        normalized.get().to_string()
-    } else {
-        text.to_string()
-    };
+use tk::models::bpe::parity_utils;
 
-    // Pre-tokenize
-    if let Some(pretok) = pre_tokenizer {
-        let mut pretokenized = tk::PreTokenizedString::from(normalized_text.as_str());
-        pretok
-            .pre_tokenize(&mut pretokenized)
-            .map_err(|e| exceptions::PyValueError::new_err(format!("Pre-tokenization error: {}", e)))?;
-
-        let splits = pretokenized.get_splits(
-            tk::OffsetReferential::Original,
-            tk::OffsetType::Byte,
-        );
-        for (word, _, _) in splits {
-            if !word.is_empty() {
-                *word_counts.entry(CompactString::from(word)).or_default() += 1;
-            }
-        }
-    } else {
-        let word = normalized_text.trim();
-        if !word.is_empty() {
-            *word_counts.entry(CompactString::from(word)).or_default() += 1;
-        }
-    }
-    Ok(())
-}
-
-fn pre_tokenize_file(
-    path: &str,
-    normalizer: Option<&PyNormalizer>,
-    pre_tokenizer: Option<&PyPreTokenizer>,
+fn map_tk_err(
+    result: tk::tokenizer::Result<AHashMap<CompactString, u64>>,
 ) -> PyResult<AHashMap<CompactString, u64>> {
-    let file = File::open(path)
-        .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
-    let mut reader = BufReader::new(file);
-    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
-
-    // Use read_line to preserve trailing newline, matching Python's `for line in fobj`
-    // which includes \n. This matters for ByteLevel pre-tokenizer where \n → Ċ.
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)
-            .map_err(|e| exceptions::PyIOError::new_err(format!("Read error: {}", e)))?;
-        if bytes_read == 0 {
-            break;
-        }
-        pre_tokenize_text(&line, normalizer, pre_tokenizer, &mut word_counts)?;
-    }
-    Ok(word_counts)
-}
-
-fn pre_tokenize_parquet_file(
-    path: &str,
-    text_column: &str,
-    normalizer: Option<&PyNormalizer>,
-    pre_tokenizer: Option<&PyPreTokenizer>,
-) -> PyResult<AHashMap<CompactString, u64>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let file = File::open(path)
-        .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot open {}: {}", path, e)))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| exceptions::PyValueError::new_err(format!("Failed to create parquet reader for {}: {}", path, e)))?;
-    let reader = builder.build()
-        .map_err(|e| exceptions::PyValueError::new_err(format!("Failed to build parquet reader for {}: {}", path, e)))?;
-    let mut word_counts: AHashMap<CompactString, u64> = AHashMap::new();
-
-    for batch in reader {
-        let batch = batch
-            .map_err(|e| exceptions::PyIOError::new_err(format!("Failed to read batch from {}: {}", path, e)))?;
-        let col = batch.column_by_name(text_column).ok_or_else(|| {
-            exceptions::PyValueError::new_err(format!("Column '{}' not found in {}", text_column, path))
-        })?;
-
-        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
-            for i in 0..arr.len() {
-                if arr.is_null(i) { continue; }
-                pre_tokenize_text(arr.value(i), normalizer, pre_tokenizer, &mut word_counts)?;
-            }
-        } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
-            for i in 0..arr.len() {
-                if arr.is_null(i) { continue; }
-                pre_tokenize_text(arr.value(i), normalizer, pre_tokenizer, &mut word_counts)?;
-            }
-        } else {
-            return Err(exceptions::PyValueError::new_err(
-                format!("Column '{}' in {} is not a string type", text_column, path)
-            ));
-        }
-    }
-    Ok(word_counts)
-}
-
-fn pre_tokenize_auto(
-    path: &str,
-    text_column: &str,
-    normalizer: Option<&PyNormalizer>,
-    pre_tokenizer: Option<&PyPreTokenizer>,
-) -> PyResult<AHashMap<CompactString, u64>> {
-    if path.ends_with(".parquet") {
-        pre_tokenize_parquet_file(path, text_column, normalizer, pre_tokenizer)
-    } else {
-        pre_tokenize_file(path, normalizer, pre_tokenizer)
-    }
+    result.map_err(|e| exceptions::PyRuntimeError::new_err(format!("{}", e)))
 }
 
 /// Trainer for parity-aware BPE that ensures cross-lingual fairness in tokenization.
@@ -1034,7 +915,7 @@ fn pre_tokenize_auto(
 ///         Algorithm variant: ``"base"`` (default) or ``"window"`` (moving-window balancing).
 ///
 ///     min_frequency (:obj:`int`, `optional`):
-///         Minimum pair frequency to merge. Defaults to ``2``.
+///         Minimum pair frequency to merge. Defaults to ``0``.
 ///
 ///     global_merges (:obj:`int`, `optional`):
 ///         Number of initial standard BPE merges before switching to parity mode. Defaults to ``0``.
@@ -1073,6 +954,73 @@ pub struct PyParityBpeTrainer {
     window_size: usize,
     alpha: f64,
     total_symbols: bool,
+    special_tokens: Vec<tk::AddedToken>,
+    show_progress: bool,
+    limit_alphabet: Option<usize>,
+    initial_alphabet: Vec<char>,
+    continuing_subword_prefix: Option<String>,
+    end_of_word_suffix: Option<String>,
+    max_token_length: Option<usize>,
+}
+
+impl Default for PyParityBpeTrainer {
+    fn default() -> Self {
+        Self {
+            num_merges: 32000,
+            variant: "base".to_string(),
+            min_frequency: 0,
+            ratio: None,
+            global_merges: 0,
+            window_size: 100,
+            alpha: 2.0,
+            total_symbols: false,
+            special_tokens: Vec::new(),
+            show_progress: true,
+            limit_alphabet: None,
+            initial_alphabet: Vec::new(),
+            continuing_subword_prefix: None,
+            end_of_word_suffix: None,
+            max_token_length: None,
+        }
+    }
+}
+
+impl PyParityBpeTrainer {
+    /// Build a Rust `ParityBpeTrainerBuilder` from the current Python-side settings.
+    fn make_builder(
+        &self,
+        parity_variant: tk::models::bpe::ParityVariant,
+    ) -> tk::models::bpe::ParityBpeTrainerBuilder {
+        use tk::models::bpe::ParityBpeTrainer as RustTrainer;
+
+        let mut builder = RustTrainer::builder()
+            .min_frequency(self.min_frequency)
+            .num_merges(self.num_merges)
+            .show_progress(self.show_progress)
+            .variant(parity_variant)
+            .global_merges(self.global_merges)
+            .window_size(self.window_size)
+            .alpha(self.alpha)
+            .total_symbols(self.total_symbols)
+            .special_tokens(self.special_tokens.clone());
+
+        if let Some(limit) = self.limit_alphabet {
+            builder = builder.limit_alphabet(limit);
+        }
+        if !self.initial_alphabet.is_empty() {
+            builder = builder.initial_alphabet(
+                self.initial_alphabet.iter().copied().collect(),
+            );
+        }
+        if let Some(ref prefix) = self.continuing_subword_prefix {
+            builder = builder.continuing_subword_prefix(prefix.clone());
+        }
+        if let Some(ref suffix) = self.end_of_word_suffix {
+            builder = builder.end_of_word_suffix(suffix.clone());
+        }
+        builder = builder.max_token_length(self.max_token_length);
+        builder
+    }
 }
 
 #[pymethods]
@@ -1081,13 +1029,21 @@ impl PyParityBpeTrainer {
     #[pyo3(signature = (
         num_merges = 32000,
         variant = "base",
-        min_frequency = 2,
+        min_frequency = 0,
         ratio = None,
         global_merges = 0,
         window_size = 100,
         alpha = 2.0,
-        total_symbols = false
+        total_symbols = false,
+        special_tokens = None,
+        show_progress = true,
+        limit_alphabet = None,
+        initial_alphabet = None,
+        continuing_subword_prefix = None,
+        end_of_word_suffix = None,
+        max_token_length = None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         num_merges: usize,
         variant: &str,
@@ -1097,6 +1053,13 @@ impl PyParityBpeTrainer {
         window_size: usize,
         alpha: f64,
         total_symbols: bool,
+        special_tokens: Option<&Bound<'_, PyList>>,
+        show_progress: bool,
+        limit_alphabet: Option<usize>,
+        initial_alphabet: Option<Vec<char>>,
+        continuing_subword_prefix: Option<String>,
+        end_of_word_suffix: Option<String>,
+        max_token_length: Option<usize>,
     ) -> PyResult<Self> {
         match variant {
             "base" | "window" => {}
@@ -1104,6 +1067,27 @@ impl PyParityBpeTrainer {
                 format!("Unknown variant '{}'. Use 'base' or 'window'.", variant)
             )),
         }
+
+        let parsed_special_tokens = if let Some(tokens) = special_tokens {
+            tokens
+                .into_iter()
+                .map(|token| {
+                    if let Ok(content) = token.extract::<String>() {
+                        Ok(tk::tokenizer::AddedToken::from(content, true))
+                    } else if let Ok(mut token) = token.extract::<PyRefMut<PyAddedToken>>() {
+                        token.special = true;
+                        Ok(token.get_token())
+                    } else {
+                        Err(exceptions::PyTypeError::new_err(
+                            "special_tokens must be a List[Union[str, AddedToken]]",
+                        ))
+                    }
+                })
+                .collect::<PyResult<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
         Ok(PyParityBpeTrainer {
             num_merges,
             variant: variant.to_string(),
@@ -1113,6 +1097,13 @@ impl PyParityBpeTrainer {
             window_size,
             alpha,
             total_symbols,
+            special_tokens: parsed_special_tokens,
+            show_progress,
+            limit_alphabet,
+            initial_alphabet: initial_alphabet.unwrap_or_default(),
+            continuing_subword_prefix,
+            end_of_word_suffix,
+            max_token_length,
         })
     }
 
@@ -1127,17 +1118,25 @@ impl PyParityBpeTrainer {
     ///         A tokenizer instance to train.  Its pre-tokenizer (and optionally
     ///         normalizer) should already be configured.
     ///
-    ///     train_files (:obj:`List[str]`):
+    ///     train_files (:obj:`List[str]`, `optional`):
     ///         List of training file paths, one per language.
+    ///         Either ``train_files`` or ``config`` must be provided.
     ///
     ///     dev_files (:obj:`List[str]`, `optional`):
-    ///         List of development file paths for parity computation (multi-parallel).
+    ///         List of development file paths for parity computation.
+    ///         If provided, dev-set token lengths drive language selection
+    ///         (overrides ``ratio``).
     ///
     ///     ratio (:obj:`List[float]`, `optional`):
     ///         Target compression ratios per language (alternative to ``dev_files``).
     ///
     ///     output (:obj:`str`, `optional`):
     ///         Path to write merge rules to a file.
+    ///
+    ///     config (:obj:`str`, `optional`):
+    ///         Path to a JSON config file defining language groups with input files,
+    ///         compression ratios, and optional dev files.  When provided, overrides
+    ///         ``train_files``, ``dev_files``, and ``ratio``.
     #[pyo3(signature = (tokenizer, train_files = None, dev_files = None, ratio = None, output = None, config = None))]
     fn train(
         &self,
@@ -1148,7 +1147,7 @@ impl PyParityBpeTrainer {
         output: Option<String>,
         config: Option<String>,
     ) -> PyResult<()> {
-        use tk::models::bpe::{ParityBpeTrainer as RustTrainer, ParityVariant, TrainingConfig, BPE};
+        use tk::models::bpe::{ParityVariant, TrainingConfig, BPE};
 
         let parity_variant = match self.variant.as_str() {
             "base" => ParityVariant::Base,
@@ -1159,40 +1158,61 @@ impl PyParityBpeTrainer {
         // Extract normalizer and pre-tokenizer from the user-configured tokenizer
         let normalizer = tokenizer.tokenizer.get_normalizer().cloned();
         let pre_tokenizer = tokenizer.tokenizer.get_pre_tokenizer().cloned();
+        let norm_ref: Option<&dyn tk::Normalizer> = normalizer.as_ref().map(|n| n as &dyn tk::Normalizer);
+        let pretok_ref: Option<&dyn tk::PreTokenizer> = pre_tokenizer.as_ref().map(|p| p as &dyn tk::PreTokenizer);
 
         if let Some(ref cfg_path) = config {
             // Config-driven training
             let training_config = TrainingConfig::from_file(cfg_path)
                 .map_err(|e| exceptions::PyValueError::new_err(format!("Cannot load config {}: {}", cfg_path, e)))?;
 
-            let config_ratios = training_config.ratios();
+            let has_dev = training_config.has_dev();
 
-            let builder = RustTrainer::builder()
-                .min_frequency(self.min_frequency)
-                .num_merges(self.num_merges)
-                .show_progress(true)
-                .variant(parity_variant)
-                .global_merges(self.global_merges)
-                .window_size(self.window_size)
-                .alpha(self.alpha)
-                .total_symbols(self.total_symbols)
-                .ratio(config_ratios);
+            let mut builder = self.make_builder(parity_variant);
+
+            // Only use ratios if no dev files are present in the config
+            if !has_dev {
+                builder = builder.ratio(training_config.ratios());
+            }
+
             let mut trainer = builder.build();
 
+            // Feed training data
             for (lang_idx, lang_cfg) in training_config.languages.iter().enumerate() {
                 let mut merged_counts: AHashMap<CompactString, u64> = AHashMap::new();
                 for file_path in &lang_cfg.input {
-                    let file_counts = pre_tokenize_auto(
+                    let file_counts = map_tk_err(parity_utils::pre_tokenize_auto(
                         file_path,
                         &lang_cfg.text_column,
-                        normalizer.as_ref(),
-                        pre_tokenizer.as_ref(),
-                    )?;
+                        norm_ref,
+                        pretok_ref,
+                    ))?;
                     for (word, count) in file_counts {
                         *merged_counts.entry(word).or_default() += count;
                     }
                 }
                 trainer.feed_language(lang_idx, merged_counts);
+            }
+
+            // Feed dev data from config
+            if has_dev {
+                for (lang_idx, lang_cfg) in training_config.languages.iter().enumerate() {
+                    if let Some(ref dev_paths) = lang_cfg.dev {
+                        let mut dev_counts: AHashMap<CompactString, u64> = AHashMap::new();
+                        for file_path in dev_paths {
+                            let file_counts = map_tk_err(parity_utils::pre_tokenize_auto(
+                                file_path,
+                                &lang_cfg.text_column,
+                                norm_ref,
+                                pretok_ref,
+                            ))?;
+                            for (word, count) in file_counts {
+                                *dev_counts.entry(word).or_default() += count;
+                            }
+                        }
+                        trainer.feed_dev_language(lang_idx, dev_counts);
+                    }
+                }
             }
 
             // Train
@@ -1217,7 +1237,7 @@ impl PyParityBpeTrainer {
             tokenizer.tokenizer.with_model(py_model);
             tokenizer.tokenizer.add_special_tokens(&special_tokens);
         } else {
-            // Original file-per-language mode
+            // File-per-language mode
             let train_files = train_files.ok_or_else(|| {
                 exceptions::PyValueError::new_err("Either 'train_files' or 'config' must be provided")
             })?;
@@ -1226,18 +1246,15 @@ impl PyParityBpeTrainer {
                 return Err(exceptions::PyValueError::new_err("train_files must not be empty"));
             }
 
-            // Use ratio from train() arg, fall back to constructor arg
-            let effective_ratio = ratio.or_else(|| self.ratio.clone());
+            // Dev files take precedence over ratios
+            let has_dev = dev_files.as_ref().is_some_and(|d| !d.is_empty());
+            let effective_ratio = if has_dev {
+                None
+            } else {
+                ratio.or_else(|| self.ratio.clone())
+            };
 
-            let mut builder = RustTrainer::builder()
-                .min_frequency(self.min_frequency)
-                .num_merges(self.num_merges)
-                .show_progress(true)
-                .variant(parity_variant)
-                .global_merges(self.global_merges)
-                .window_size(self.window_size)
-                .alpha(self.alpha)
-                .total_symbols(self.total_symbols);
+            let mut builder = self.make_builder(parity_variant);
 
             if let Some(r) = effective_ratio {
                 builder = builder.ratio(r);
@@ -1247,14 +1264,21 @@ impl PyParityBpeTrainer {
 
             // Feed training data
             for (lang, path) in train_files.iter().enumerate() {
-                let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
+                let word_counts = map_tk_err(parity_utils::pre_tokenize_file(path, norm_ref, pretok_ref))?;
                 trainer.feed_language(lang, word_counts);
             }
 
             // Feed dev data
             if let Some(ref dev) = dev_files {
+                if dev.len() != train_files.len() {
+                    return Err(exceptions::PyValueError::new_err(format!(
+                        "dev_files length ({}) must match train_files length ({})",
+                        dev.len(),
+                        train_files.len()
+                    )));
+                }
                 for (lang, path) in dev.iter().enumerate() {
-                    let word_counts = pre_tokenize_file(path, normalizer.as_ref(), pre_tokenizer.as_ref())?;
+                    let word_counts = map_tk_err(parity_utils::pre_tokenize_file(path, norm_ref, pretok_ref))?;
                     trainer.feed_dev_language(lang, word_counts);
                 }
             }
@@ -1323,6 +1347,188 @@ impl PyParityBpeTrainer {
 
     #[setter]
     fn set_total_symbols(&mut self, v: bool) { self.total_symbols = v; }
+
+    #[getter]
+    fn get_show_progress(&self) -> bool { self.show_progress }
+
+    #[setter]
+    fn set_show_progress(&mut self, v: bool) { self.show_progress = v; }
+
+    #[getter]
+    fn get_special_tokens(&self) -> Vec<PyAddedToken> {
+        self.special_tokens.iter().map(|tok| tok.clone().into()).collect()
+    }
+
+    #[setter]
+    fn set_special_tokens(&mut self, special_tokens: &Bound<'_, PyList>) -> PyResult<()> {
+        self.special_tokens = special_tokens
+            .into_iter()
+            .map(|token| {
+                if let Ok(content) = token.extract::<String>() {
+                    Ok(tk::tokenizer::AddedToken::from(content, true))
+                } else if let Ok(mut token) = token.extract::<PyRefMut<PyAddedToken>>() {
+                    token.special = true;
+                    Ok(token.get_token())
+                } else {
+                    Err(exceptions::PyTypeError::new_err(
+                        "special_tokens must be a List[Union[str, AddedToken]]",
+                    ))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(())
+    }
+
+    #[getter]
+    fn get_limit_alphabet(&self) -> Option<usize> { self.limit_alphabet }
+
+    #[setter]
+    fn set_limit_alphabet(&mut self, v: Option<usize>) { self.limit_alphabet = v; }
+
+    #[getter]
+    fn get_initial_alphabet(&self) -> Vec<String> {
+        self.initial_alphabet.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[setter]
+    fn set_initial_alphabet(&mut self, alphabet: Vec<char>) {
+        self.initial_alphabet = alphabet;
+    }
+
+    #[getter]
+    fn get_continuing_subword_prefix(&self) -> Option<&str> {
+        self.continuing_subword_prefix.as_deref()
+    }
+
+    #[setter]
+    fn set_continuing_subword_prefix(&mut self, v: Option<String>) {
+        self.continuing_subword_prefix = v;
+    }
+
+    #[getter]
+    fn get_end_of_word_suffix(&self) -> Option<&str> {
+        self.end_of_word_suffix.as_deref()
+    }
+
+    #[setter]
+    fn set_end_of_word_suffix(&mut self, v: Option<String>) {
+        self.end_of_word_suffix = v;
+    }
+
+    #[getter]
+    fn get_max_token_length(&self) -> Option<usize> { self.max_token_length }
+
+    #[setter]
+    fn set_max_token_length(&mut self, v: Option<usize>) { self.max_token_length = v; }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ParityBpeTrainer(num_merges={}, variant=\"{}\", min_frequency={}, \
+             global_merges={}, window_size={}, alpha={}, total_symbols={})",
+            self.num_merges, self.variant, self.min_frequency,
+            self.global_merges, self.window_size, self.alpha, self.total_symbols,
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("num_merges", self.num_merges)?;
+        dict.set_item("variant", &self.variant)?;
+        dict.set_item("min_frequency", self.min_frequency)?;
+        dict.set_item("global_merges", self.global_merges)?;
+        dict.set_item("window_size", self.window_size)?;
+        dict.set_item("alpha", self.alpha)?;
+        dict.set_item("total_symbols", self.total_symbols)?;
+        dict.set_item("show_progress", self.show_progress)?;
+        dict.set_item(
+            "ratio",
+            self.ratio.as_ref().map(|r| PyList::new(py, r).unwrap()),
+        )?;
+        let special: Vec<String> = self
+            .special_tokens
+            .iter()
+            .map(|t| t.content.clone())
+            .collect();
+        dict.set_item("special_tokens", PyList::new(py, &special)?)?;
+        dict.set_item("limit_alphabet", self.limit_alphabet)?;
+        let alphabet_strs: Vec<String> = self.initial_alphabet.iter().map(|c| c.to_string()).collect();
+        dict.set_item("initial_alphabet", PyList::new(py, &alphabet_strs)?)?;
+        dict.set_item("continuing_subword_prefix", &self.continuing_subword_prefix)?;
+        dict.set_item("end_of_word_suffix", &self.end_of_word_suffix)?;
+        dict.set_item("max_token_length", self.max_token_length)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn __setstate__(&mut self, py: Python, state: Py<PyAny>) -> PyResult<()> {
+        let dict = state.cast_bound::<PyDict>(py)?;
+        self.num_merges = dict
+            .get_item("num_merges")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("num_merges"))?
+            .extract()?;
+        self.variant = dict
+            .get_item("variant")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("variant"))?
+            .extract()?;
+        self.min_frequency = dict
+            .get_item("min_frequency")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("min_frequency"))?
+            .extract()?;
+        self.global_merges = dict
+            .get_item("global_merges")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("global_merges"))?
+            .extract()?;
+        self.window_size = dict
+            .get_item("window_size")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("window_size"))?
+            .extract()?;
+        self.alpha = dict
+            .get_item("alpha")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("alpha"))?
+            .extract()?;
+        self.total_symbols = dict
+            .get_item("total_symbols")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("total_symbols"))?
+            .extract()?;
+        self.show_progress = dict
+            .get_item("show_progress")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("show_progress"))?
+            .extract()?;
+        self.ratio = dict
+            .get_item("ratio")?
+            .and_then(|v| if v.is_none() { None } else { Some(v.extract().ok()?) });
+        let special_strs: Vec<String> = dict
+            .get_item("special_tokens")?
+            .ok_or_else(|| exceptions::PyKeyError::new_err("special_tokens"))?
+            .extract()?;
+        self.special_tokens = special_strs
+            .into_iter()
+            .map(|s| tk::tokenizer::AddedToken::from(s, true))
+            .collect();
+        self.limit_alphabet = dict
+            .get_item("limit_alphabet")?
+            .and_then(|v| if v.is_none() { None } else { Some(v.extract().ok()?) });
+        self.initial_alphabet = dict
+            .get_item("initial_alphabet")?
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| s.chars().next())
+            .collect();
+        self.continuing_subword_prefix = dict
+            .get_item("continuing_subword_prefix")?
+            .and_then(|v| if v.is_none() { None } else { Some(v.extract().ok()?) });
+        self.end_of_word_suffix = dict
+            .get_item("end_of_word_suffix")?
+            .and_then(|v| if v.is_none() { None } else { Some(v.extract().ok()?) });
+        self.max_token_length = dict
+            .get_item("max_token_length")?
+            .and_then(|v| if v.is_none() { None } else { Some(v.extract().ok()?) });
+        Ok(())
+    }
 }
 
 /// Trainers Module
