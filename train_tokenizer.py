@@ -119,18 +119,23 @@ def train_parity_bpe(args):
     """Train a parity-aware BPE tokenizer."""
     tokenizer = build_tokenizer(args.tokenizer_config)
 
-    trainer = ParityBpeTrainer(
-        num_merges=args.vocab_size,
-        variant=args.variant,
-        min_frequency=args.min_frequency,
-        global_merges=args.global_merges,
-        window_size=args.window_size,
-        alpha=args.alpha,
-        total_symbols=True,
-        special_tokens=args.special_tokens or [],
-    )
+    trainer_kwargs = {
+        "num_merges": args.vocab_size,
+        "variant": args.variant,
+        "min_frequency": args.min_frequency,
+        "global_merges": args.global_merges,
+        "window_size": args.window_size,
+        "alpha": args.alpha,
+        "total_symbols": True,
+    }
+    if args.special_tokens:
+        trainer_kwargs["special_tokens"] = args.special_tokens
+    if args.max_token_length is not None:
+        trainer_kwargs["max_token_length"] = args.max_token_length
 
-    print(f"Training parity-aware BPE (vocab_size={args.vocab_size}, variant={args.variant}) ...")
+    trainer = ParityBpeTrainer(**trainer_kwargs)
+
+    print(f"Training parity-aware BPE (num_merges={args.vocab_size}, variant={args.variant}) ...")
     trainer.train(tokenizer, config=args.data_config)
 
     return tokenizer
