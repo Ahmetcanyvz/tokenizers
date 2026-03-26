@@ -523,6 +523,23 @@ impl Unigram {
         Ok(())
     }
 
+    /// Keep (or replace) language weight sets already in f32 (zero-conversion path).
+    pub fn set_weight_sets_f32(&mut self, sets: Vec<Box<[f32]>>) -> Result<()> {
+        if sets.is_empty() {
+            self.cached_weight_sets = Some(Vec::new());
+            return Ok(());
+        }
+        let v = self.vocab.len();
+        if !sets.iter().all(|w| w.len() == v) {
+            return Err(Box::new(UnigramError::MismatchedWeightLength {
+                expected: v,
+                got: sets[0].len(),
+            }));
+        }
+        self.cached_weight_sets = Some(sets);
+        Ok(())
+    }
+
     pub fn clear_weight_sets(&mut self) {
         self.cached_weight_sets = None;
     }
